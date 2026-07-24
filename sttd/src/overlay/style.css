@@ -1,0 +1,173 @@
+/* sttd layer-shell overlay */
+
+window.sttd-overlay {
+  background: transparent;
+}
+
+.sttd-card {
+  background-color: alpha(#1e1e2e, 0.92);
+  border-radius: 16px;
+  border: 1px solid alpha(#cdd6f4, 0.12);
+  padding: 12px 16px;
+  min-width: 280px;
+  box-shadow: 0 8px 32px alpha(#000000, 0.35);
+}
+
+/* Mic circle — Pause / Resume */
+button.sttd-mic {
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0;
+  border-radius: 999px;
+  background-color: #a6e3a1;
+  color: #11111b;
+  font-size: 18px;
+  font-weight: 700;
+  border: none;
+  box-shadow: 0 0 0 2px alpha(#a6e3a1, 0.35);
+  transition: background-color 150ms ease, box-shadow 150ms ease;
+}
+
+button.sttd-mic:hover {
+  background-color: #b6f3b1;
+}
+
+button.sttd-mic.paused {
+  background-color: #fab387;
+  box-shadow: 0 0 0 2px alpha(#fab387, 0.35);
+}
+
+/* Stop */
+button.sttd-stop {
+  min-width: 40px;
+  min-height: 40px;
+  padding: 0;
+  border-radius: 12px;
+  background-color: alpha(#f38ba8, 0.2);
+  color: #f38ba8;
+  font-size: 16px;
+  border: 1px solid alpha(#f38ba8, 0.35);
+}
+
+button.sttd-stop:hover {
+  background-color: alpha(#f38ba8, 0.35);
+}
+
+label.sttd-committed {
+  color: #cdd6f4;
+  font-size: 14px;
+  opacity: 0.95;
+}
+
+label.sttd-preview {
+  color: #bac2de;
+  font-size: 13px;
+  font-style: italic;
+  opacity: 1;
+  /* duration overridden at runtime via provider when needed */
+  transition: opacity 200ms ease-in-out;
+}
+
+label.sttd-preview.fading {
+  opacity: 0;
+}
+
+/* 3-dot speech-pending pulse */
+.sttd-dots {
+  min-width: 28px;
+}
+
+label.sttd-dot {
+  color: #89b4fa;
+  font-size: 18px;
+  font-weight: 700;
+  opacity: 0.25;
+}
+
+.sttd-dots.pending label.sttd-dot {
+  animation: sttd-pulse 1.1s ease-in-out infinite;
+}
+
+.sttd-dots.pending label.sttd-dot:nth-child(1) {
+  animation-delay: 0ms;
+}
+.sttd-dots.pending label.sttd-dot:nth-child(2) {
+  animation-delay: 160ms;
+}
+.sttd-dots.pending label.sttd-dot:nth-child(3) {
+  animation-delay: 320ms;
+}
+
+@keyframes sttd-pulse {
+  0%,
+  80%,
+  100% {
+    opacity: 0.2;
+  }
+  40% {
+    opacity: 1;
+  }
+}
+
+/* Edit review pane */
+.sttd-edit-card {
+  background-color: alpha(#1e1e2e, 0.95);
+  border-radius: 16px;
+  border: 1px solid alpha(#cdd6f4, 0.12);
+  padding: 14px 16px;
+  min-width: 420px;
+  min-height: 180px;
+  box-shadow: 0 8px 32px alpha(#000000, 0.4);
+}
+
+.sttd-edit-title {
+  color: #cdd6f4;
+  font-size: 13px;
+  font-weight: 600;
+  opacity: 0.85;
+  margin-bottom: 6px;
+}
+
+textview.sttd-edit-view {
+  background-color: alpha(#11111b, 0.65);
+  color: #cdd6f4;
+  border-radius: 10px;
+  padding: 8px;
+  font-size: 14px;
+  min-height: 120px;
+}
+
+textview.sttd-edit-view text {
+  background-color: transparent;
+  color: #cdd6f4;
+}
+
+.sttd-edit-actions {
+  margin-top: 10px;
+}
+
+button.sttd-copy {
+  background-color: #89b4fa;
+  color: #11111b;
+  font-weight: 600;
+  border-radius: 10px;
+  padding: 8px 16px;
+  border: none;
+}
+
+button.sttd-copy:hover {
+  background-color: #b4befe;
+}
+
+button.sttd-discard {
+  background-color: alpha(#f38ba8, 0.18);
+  color: #f38ba8;
+  font-weight: 600;
+  border-radius: 10px;
+  padding: 8px 16px;
+  border: 1px solid alpha(#f38ba8, 0.35);
+}
+
+button.sttd-discard:hover {
+  background-color: alpha(#f38ba8, 0.3);
+}

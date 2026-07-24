@@ -1,0 +1,16 @@
+[package]
+name = "sttctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI control client for the sttd Wayland speech-to-text daemon"
+publish = false
+
+[[bin]]
+name = "sttctl"
+path = "src/main.rs"
+
+[dependencies]
+proto = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

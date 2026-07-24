@@ -1,0 +1,25 @@
+[Unit]
+Description=sttd Wayland speech-to-text daemon
+Documentation=file://%h/src/stt-wayland/README.md
+PartOf=graphical-session.target
+After=graphical-session.target pipewire.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+# Adjust ExecStart to your install path (cargo install, or absolute build path).
+ExecStart=%h/.local/bin/sttd --daemon
+Restart=on-failure
+RestartSec=2
+# Inherit WAYLAND_DISPLAY / XDG_RUNTIME_DIR from the user session.
+Environment=RUST_LOG=info
+
+# Hardening (keep session-facing sockets available)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%t %h/.local/share/sttd %h/.config/sttd
+PrivateTmp=true
+
+[Install]
+WantedBy=graphical-session.target

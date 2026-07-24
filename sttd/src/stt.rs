@@ -29,6 +29,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvError, SendError, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::fs;
+use std::io::{self, Read, Write};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -429,11 +431,26 @@ impl SttWorker {
         let path = &self.cfg.model_path;
 
         if !path.exists() {
-            bail!(
-                "whisper model not found at {} — install base.en/small.en under \
-                 ~/.local/share/sttd/models/ (e.g. ggml-base.en.bin)",
-                path.display()
-            );
+            match download_model(path) {
+                Ok(true) => {
+                    // Downloaded successfully — fall through to load.
+                }
+                Ok(false) => {
+                    bail!(
+                        "whisper model not found at {} — install base.en/small.en under \
+                         ~/.local/share/sttd/models/ (e.g. ggml-base.en.bin)",
+                        path.display()
+                    );
+                }
+                Err(e) => {
+                    bail!(
+                        "whisper model not found at {} and auto-download failed: {e:#} \
+                         — install base.en/small.en under ~/.local/share/sttd/models/ \
+                         (e.g. ggml-base.en.bin)",
+                        path.display()
+                    );
+                }
+            }
         }
 
         #[cfg(feature = "stt-engine")]
@@ -642,6 +659,83 @@ fn truncate_prompt(text: &str, max_chars: usize) -> String {
 
 fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Known whisper.cpp model filenames available for auto-download.
+const KNOWN_MODELS: &[&str] = &[
+    "ggml-tiny.en.bin",
+    "ggml-base.en.bin",
+    "ggml-small.en.bin",
+    "ggml-medium.en.bin",
+];
+
+/// Hugging Face repo for whisper.cpp GGML models.
+const HF_REPO: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
+
+/// Attempt to download a whisper model from Hugging Face.
+///
+/// Returns `Ok(true)` on success, `Ok(false)` if the model filename is not in
+/// the known list (no download attempted), and `Err` on network/IO failure.
+fn download_model(path: &Path) -> Result<bool> {
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    if !KNOWN_MODELS.contains(&filename) {
+        return Ok(false);
+    }
+
+    let url = format!("{HF_REPO}/{filename}");
+    info!(%url, "downloading whisper model");
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating model directory {}", parent.display()))?;
+    }
+
+    let response = ureq::get(&url)
+        .call()
+        .with_context(|| format!("HTTP request failed for {url}"))?;
+
+    let total: u64 = response
+        .header("Content-Length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    let mut reader = response.into_reader();
+    let mut file = fs::File::create(path)
+        .with_context(|| format!("creating model file {}", path.display()))?;
+    let mut buf = [0u8; 65536];
+    let mut downloaded: u64 = 0;
+    let mut last_report: u64 = 0;
+
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .with_context(|| "reading download stream")?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n])
+            .with_context(|| "writing model file")?;
+        downloaded += n as u64;
+
+        // Report progress every ~5 MiB.
+        if downloaded - last_report >= 5_242_880 {
+            if total > 0 {
+                let pct = (downloaded * 100) / total;
+                info!(pct, downloaded, total, "model download progress");
+            } else {
+                info!(downloaded, "model download progress (unknown total)");
+            }
+            last_report = downloaded;
+        }
+    }
+
+    file.flush().with_context(|| "flushing model file")?;
+    info!(downloaded, "model downloaded");
+    Ok(true)
 }
 
 #[cfg(test)]

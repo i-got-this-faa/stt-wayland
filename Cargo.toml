@@ -54,3 +54,6 @@ wayland-protocols-misc = { version = "0.3", features = ["client"] }
 
 # Misc
 libc = "0.2"
+
+# HTTP (model download)
+ureq = "2"

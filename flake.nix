@@ -76,6 +76,10 @@
           type = "app";
           program = "${self.packages.${system}.default}/bin/sttd";
         };
+        settings = {
+          type = "app";
+          program = "${self.packages.${system}.default}/bin/stt-settings";
+        };
       });
     };
 }

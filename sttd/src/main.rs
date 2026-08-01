@@ -45,7 +45,7 @@ use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
 use crate::audio::AudioCapture;
-use crate::config::{Config, ModelResidency};
+use crate::config::{Config, ModelResidency, ProfileStore};
 use crate::inject::Injector;
 use crate::overlay::{ChannelControlSink, ControlEvent, OverlayHandle};
 use crate::state::{AppState, SetModeResult, StartResult, StopResult};
@@ -66,8 +66,12 @@ struct Cli {
     daemon: bool,
 
     /// Path to config.toml (default: ~/.config/sttd/config.toml).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "profile")]
     config: Option<PathBuf>,
+
+    /// Load a named profile from ~/.config/sttd/profiles/.
+    #[arg(long, conflicts_with = "config")]
+    profile: Option<String>,
 
     /// Override Unix socket path (default: $XDG_RUNTIME_DIR/sttd.sock).
     #[arg(long)]
@@ -142,7 +146,12 @@ fn main() -> ExitCode {
 fn run() -> Result<()> {
     let cli = Cli::parse();
 
-    let cfg = Config::load(cli.config.as_deref()).context("load config")?;
+    let cfg = match cli.profile.as_deref() {
+        Some(name) => ProfileStore::default()
+            .load(name)
+            .with_context(|| format!("load profile '{name}'"))?,
+        None => Config::load(cli.config.as_deref()).context("load config")?,
+    };
 
     if cli.print_config {
         println!("{}", toml::to_string_pretty(&cfg)?);

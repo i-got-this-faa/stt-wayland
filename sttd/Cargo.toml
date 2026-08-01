@@ -10,8 +10,13 @@ publish = false
 name = "sttd"
 path = "src/main.rs"
 
+[[bin]]
+name = "stt-settings"
+path = "src/settings.rs"
+required-features = ["settings"]
+
 [features]
-default = ["audio", "stt-engine", "overlay", "inject", "tray"]
+default = ["audio", "stt-engine", "overlay", "inject", "tray", "settings"]
 # Optional feature gates so proto/cli (and minimal daemon stubs) can check without
 # full system libraries. Default enables the full stack when libs are present.
 audio = ["dep:pipewire"]

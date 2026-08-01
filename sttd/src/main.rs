@@ -390,6 +390,8 @@ struct Daemon {
     _pipe_join: JoinHandle<()>,
 
     last_speech_pending: bool,
+    /// STT result generation accepted by the active recording session.
+    stt_session_id: u64,
 }
 
 impl Daemon {
@@ -474,6 +476,7 @@ impl Daemon {
             .context("spawn pipeline thread")?;
 
         let overlay = OverlayHandle::new(&cfg.overlay).context("init overlay")?;
+        let stt_session_id = stt.session_id();
 
         Ok(Self {
             cfg,
@@ -486,6 +489,7 @@ impl Daemon {
             pipe_ev_rx: Some(pipe_ev_rx),
             _pipe_join: pipe_join,
             last_speech_pending: false,
+            stt_session_id,
         })
     }
 
@@ -538,6 +542,15 @@ impl Daemon {
     }
 
     fn on_transcript(&mut self, result: TranscriptResult) {
+        if result.session_id != self.stt_session_id {
+            debug!(
+                result_session = result.session_id,
+                active_session = self.stt_session_id,
+                "ignoring stale STT result"
+            );
+            return;
+        }
+
         let text = result.text.trim();
         if text.is_empty() {
             return;
@@ -547,10 +560,7 @@ impl Daemon {
         if self.state.mode != Mode::Live {
             return;
         }
-        if !matches!(
-            self.state.state,
-            DaemonState::Recording | DaemonState::Paused
-        ) {
+        if self.state.state != DaemonState::Recording {
             return;
         }
 
@@ -684,11 +694,13 @@ impl Daemon {
                             .set_error(format!("stt worker unavailable: {e:#}"));
                         return Err(e).context("retarget paused session");
                     }
-                    let _ = self.stt.reset_session();
+                    if let Ok(session_id) = self.stt.reset_session() {
+                        self.stt_session_id = session_id;
+                    }
                     self.pipe_cmd(PipeCmd::Reset);
                     self.pipe_cmd(PipeCmd::SetMode(mode));
-                    self.stt.resume_previews();
                 }
+                self.stt.resume_previews();
                 self.audio.resume_feed();
                 self.overlay.set_paused(false);
                 info!(?mode, "resumed");
@@ -711,7 +723,9 @@ impl Daemon {
             return Err(e).context("ensure whisper model loaded");
         }
 
-        let _ = self.stt.reset_session();
+        if let Ok(session_id) = self.stt.reset_session() {
+            self.stt_session_id = session_id;
+        }
         if let Err(e) = self.stt.wait_idle(Duration::from_secs(30)) {
             self.state.state = previous_state;
             self.state.mode = previous_mode;
@@ -770,6 +784,7 @@ impl Daemon {
         }
 
         let mode = self.state.mode;
+        let was_paused = self.state.state == DaemonState::Paused;
         // Stop accepting lossy previews before flushing the VAD pipeline.
         // Final chunks must reach the worker ahead of any stale previews.
         self.stt.cancel_previews();
@@ -786,6 +801,22 @@ impl Daemon {
 
         match mode {
             Mode::Live => {
+                if was_paused {
+                    // A paused Live session has no more audio to commit. Do
+                    // not wait behind an in-flight preview; it can finish in
+                    // the background and its session tag will be discarded.
+                    let stop = self.state.stop();
+                    if stop != StopResult::Stopped {
+                        warn!(?stop, "paused live stop produced unexpected state transition");
+                    }
+                    if let Ok(session_id) = self.stt.reset_session() {
+                        self.stt_session_id = session_id;
+                    }
+                    self.overlay.destroy_surface();
+                    info!("paused live session stopped → idle");
+                    return Ok(());
+                }
+
                 // Live: force-close any open utterance so the last words are transcribed.
                 if let Some(tail) = flushed {
                     if !tail.is_empty() {
@@ -810,7 +841,9 @@ impl Daemon {
                 if stop != StopResult::Stopped {
                     warn!(?stop, "live stop produced unexpected state transition");
                 }
-                let _ = self.stt.reset_session();
+                if let Ok(session_id) = self.stt.reset_session() {
+                    self.stt_session_id = session_id;
+                }
                 self.overlay.destroy_surface();
                 info!("stopped → idle");
                 Ok(())
@@ -837,7 +870,9 @@ impl Daemon {
                     }
                 };
 
-                let _ = self.stt.reset_session();
+                if let Ok(session_id) = self.stt.reset_session() {
+                    self.stt_session_id = session_id;
+                }
                 self.state.set_edit_buffer(text.clone());
                 self.overlay.show_edit_review(&text);
                 info!("entered EditReview");
@@ -863,7 +898,9 @@ impl Daemon {
             }
             SetModeResult::SessionModeChanged { from, to } => {
                 info!(?from, ?to, "retargeting pipeline mode mid-session");
-                let _ = self.stt.reset_session();
+                if let Ok(session_id) = self.stt.reset_session() {
+                    self.stt_session_id = session_id;
+                }
                 self.pipe_cmd(PipeCmd::Reset);
                 self.pipe_cmd(PipeCmd::SetMode(to));
             }
@@ -874,6 +911,7 @@ impl Daemon {
         if !self.state.pause() {
             return false;
         }
+        self.stt.cancel_previews();
         self.audio.pause_feed();
         self.overlay.set_paused(true);
         info!("paused");
@@ -884,6 +922,7 @@ impl Daemon {
         if !self.state.resume() {
             return false;
         }
+        self.stt.resume_previews();
         self.audio.resume_feed();
         self.overlay.set_paused(false);
         info!("resumed");

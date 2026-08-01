@@ -26,14 +26,14 @@
 //! return clear errors. Build with cmake + clang for whisper.cpp.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{
     self, Receiver, RecvError, SendError, SyncSender, TryRecvError, TrySendError,
 };
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -57,6 +57,9 @@ pub struct TranscriptResult {
     /// `true` for VAD-closed Live chunks and Edit full-buffer results.
     /// `false` for in-progress Live preview (overlay-only).
     pub is_final: bool,
+    /// Worker session that produced this result. Results from an older
+    /// session must not be injected into a newly started recording.
+    pub(crate) session_id: u64,
 }
 
 /// Jobs accepted by the STT worker thread.
@@ -74,7 +77,7 @@ pub enum SttCommand {
     /// Reply after every command queued before this barrier has completed.
     Barrier { reply: mpsc::Sender<()> },
     /// Clear Live overlap tail + prompt state (e.g. between Stop → Start).
-    ResetSession,
+    ResetSession { session_id: u64 },
     /// Stop the worker loop and drop the model.
     Shutdown,
 }
@@ -93,6 +96,7 @@ pub struct SttEngine {
     residency: ModelResidency,
     loaded: Arc<AtomicBool>,
     preview_cancel: Arc<AtomicBool>,
+    session_id: AtomicU64,
 }
 
 impl SttEngine {
@@ -167,6 +171,7 @@ impl SttEngine {
             residency,
             loaded,
             preview_cancel,
+            session_id: AtomicU64::new(0),
         };
 
         if residency == ModelResidency::Preload {
@@ -266,10 +271,19 @@ impl SttEngine {
     }
 
     /// Clear Live overlap + prompt continuity (call on Stop / mode switch).
-    pub fn reset_session(&self) -> Result<()> {
+    pub fn reset_session(&self) -> Result<u64> {
+        let session_id = self
+            .session_id
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
         self.cmd_tx
-            .send(SttCommand::ResetSession)
-            .map_err(|_| anyhow!("stt worker thread is not running"))
+            .send(SttCommand::ResetSession { session_id })
+            .map_err(|_| anyhow!("stt worker thread is not running"))?;
+        Ok(session_id)
+    }
+
+    pub fn session_id(&self) -> u64 {
+        self.session_id.load(Ordering::Acquire)
     }
 
     /// Cancel queued/in-flight preview work at the next worker boundary.
@@ -432,8 +446,8 @@ fn process_command(
             debug!("stt worker: shutdown");
             false
         }
-        SttCommand::ResetSession => {
-            worker.reset_session();
+        SttCommand::ResetSession { session_id } => {
+            worker.reset_session(session_id);
             true
         }
         SttCommand::EnsureLoaded { reply } => {
@@ -502,6 +516,7 @@ fn send_result(
 /// Worker-local state; lives only on the `sttd-whisper` thread.
 struct SttWorker {
     cfg: WorkerConfig,
+    session_id: u64,
     /// Tail of the last Live chunk, prepended to the next for continuity.
     overlap_tail: Vec<f32>,
     /// Last committed Live text (whisper initial_prompt).
@@ -516,6 +531,7 @@ impl SttWorker {
     fn new(cfg: WorkerConfig) -> Self {
         Self {
             cfg,
+            session_id: 0,
             overlap_tail: Vec::new(),
             last_prompt: String::new(),
             #[cfg(feature = "stt-engine")]
@@ -525,10 +541,15 @@ impl SttWorker {
         }
     }
 
-    fn reset_session(&mut self) {
+    fn clear_session(&mut self) {
         self.overlap_tail.clear();
         self.last_prompt.clear();
         debug!("stt worker: session reset");
+    }
+
+    fn reset_session(&mut self, session_id: u64) {
+        self.session_id = session_id;
+        self.clear_session();
     }
 
     fn unload(&mut self) {
@@ -538,7 +559,7 @@ impl SttWorker {
             self.ctx = None;
         }
         self.cfg.loaded.store(false, Ordering::Release);
-        self.reset_session();
+        self.clear_session();
     }
 
     fn ensure_loaded(&mut self) -> Result<()> {
@@ -614,6 +635,7 @@ impl SttWorker {
             return Ok(TranscriptResult {
                 text: String::new(),
                 is_final,
+                session_id: self.session_id,
             });
         }
 
@@ -656,7 +678,11 @@ impl SttWorker {
             );
         }
 
-        Ok(TranscriptResult { text, is_final })
+        Ok(TranscriptResult {
+            text,
+            is_final,
+            session_id: self.session_id,
+        })
     }
 
     /// Edit path: single full-buffer pass, no live overlap.
@@ -665,6 +691,7 @@ impl SttWorker {
             return Ok(TranscriptResult {
                 text: String::new(),
                 is_final: true,
+                session_id: self.session_id,
             });
         }
 
@@ -678,6 +705,7 @@ impl SttWorker {
         Ok(TranscriptResult {
             text,
             is_final: true,
+            session_id: self.session_id,
         })
     }
 
@@ -722,6 +750,14 @@ impl SttWorker {
 
         let mut out = String::new();
         for segment in state.as_iter() {
+            let no_speech_probability = segment.no_speech_probability();
+            if no_speech_probability >= MAX_NO_SPEECH_PROBABILITY {
+                debug!(
+                    no_speech_probability,
+                    "whisper: suppressing no-speech segment"
+                );
+                continue;
+            }
             let piece = segment.to_str().map(|s| s.trim()).unwrap_or("");
             if piece.is_empty() {
                 continue;
@@ -775,6 +811,11 @@ fn truncate_prompt(text: &str, max_chars: usize) -> String {
 fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
+
+/// Whisper may hallucinate prompted text when a false-positive VAD chunk is
+/// mostly silence. Drop segments that report the standard no-speech confidence
+/// instead of injecting the previous utterance again.
+const MAX_NO_SPEECH_PROBABILITY: f32 = 0.6;
 
 /// Known whisper.cpp model filenames available for auto-download.
 const KNOWN_MODELS: &[&str] = &[
@@ -838,8 +879,7 @@ fn download_model(path: &Path) -> Result<bool> {
 
         // Report progress every ~5 MiB.
         if downloaded - last_report >= 5_242_880 {
-            if total > 0 {
-                let pct = (downloaded * 100) / total;
+            if let Some(pct) = (downloaded * 100).checked_div(total) {
                 info!(pct, downloaded, total, "model download progress");
             } else {
                 info!(downloaded, "model download progress (unknown total)");

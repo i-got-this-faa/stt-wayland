@@ -24,7 +24,7 @@ stt-engine = ["dep:whisper-rs", "dep:webrtc-vad"]
 overlay = ["dep:gtk4", "dep:gtk4-layer-shell", "dep:glib"]
 inject = ["dep:wayland-client", "dep:wayland-protocols", "dep:wayland-protocols-misc"]
 tray = ["dep:ksni", "dep:resvg"]
-settings = ["dep:gtk4"]
+settings = ["dep:gtk4", "dep:adw"]
 
 [dependencies]
 proto = { workspace = true }
@@ -48,6 +48,7 @@ whisper-rs = { workspace = true, optional = true }
 gtk4 = { workspace = true, optional = true }
 gtk4-layer-shell = { workspace = true, optional = true }
 glib = { workspace = true, optional = true }
+adw = { workspace = true, optional = true }
 wayland-client = { workspace = true, optional = true }
 wayland-protocols = { workspace = true, optional = true }
 wayland-protocols-misc = { workspace = true, optional = true }

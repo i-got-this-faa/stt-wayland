@@ -41,6 +41,7 @@
               pipewire
               gtk4
               gtk4-layer-shell
+              libadwaita
               wayland
               wayland-protocols
               libclang.lib
@@ -61,7 +62,7 @@
             packages = with pkgs; [
               rust
               pkg-config cmake clang
-              pipewire gtk4 gtk4-layer-shell wayland wayland-protocols
+              pipewire gtk4 gtk4-layer-shell libadwaita wayland wayland-protocols
               libclang.lib
               stdenv.cc.cc.lib
             ];

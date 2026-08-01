@@ -1,4 +1,4 @@
-//! GTK4 settings application for `sttd`.
+//! GTK4 + libadwaita settings application for `sttd`.
 //!
 //! The app edits the daemon's complete TOML configuration through named
 //! profiles. Saving updates only the selected profile; applying a profile also
@@ -13,18 +13,28 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use adw::prelude::*;
 use anyhow::{Context, Result};
-use gtk4::prelude::*;
-use gtk4::{
-    self, Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, ComboBoxText,
-    DialogFlags, Entry, Frame, Grid, HeaderBar, Label, MessageDialog, MessageType, Orientation,
-    PolicyType, ResponseType, ScrolledWindow, SpinButton,
-};
+use gtk4::gio;
 
 use config::{default_models_dir, Config, ModelResidency, OverlayAnchor, ProfileStore};
 
-fn main() {
-    let app = Application::builder()
+const ANCHORS: [(OverlayAnchor, &str); 9] = [
+    (OverlayAnchor::Top, "Top"),
+    (OverlayAnchor::Bottom, "Bottom"),
+    (OverlayAnchor::Left, "Left"),
+    (OverlayAnchor::Right, "Right"),
+    (OverlayAnchor::TopLeft, "Top Left"),
+    (OverlayAnchor::TopRight, "Top Right"),
+    (OverlayAnchor::BottomLeft, "Bottom Left"),
+    (OverlayAnchor::BottomRight, "Bottom Right"),
+    (OverlayAnchor::Center, "Center"),
+];
+
+const RESIDENCIES: [&str; 2] = ["Preload", "Lazy"];
+
+fn main() -> gtk4::glib::ExitCode {
+    let app = adw::Application::builder()
         .application_id("io.github.stt_wayland.Settings")
         .build();
 
@@ -33,93 +43,202 @@ fn main() {
             show_startup_error(app, &error);
         }
     });
-    app.run();
+    app.run()
 }
 
 #[derive(Debug)]
 struct EditorState {
     store: ProfileStore,
+    /// Profile currently shown in the editor.
     current: String,
+    /// Profile mirrored to `config.toml`, if any.
     active: Option<String>,
     config: Config,
-    loading_profile: Cell<bool>,
 }
 
+/// Every editable row, kept flat so `collect_config` / `populate_form` can
+/// read and write them without walking the widget tree.
 struct Form {
-    profiles: ComboBoxText,
-    active_badge: Label,
-    model_picker: ComboBoxText,
-    model_path: Entry,
-    refresh_models: Button,
-    residency: ComboBoxText,
-    threads: SpinButton,
-    language: Entry,
-    sample_rate: SpinButton,
-    channels: SpinButton,
-    vad_silence_ms: SpinButton,
-    max_edit_seconds: SpinButton,
-    stt_channel_capacity: SpinButton,
-    node_name: Entry,
-    overlay_enabled: CheckButton,
-    overlay_anchor: ComboBoxText,
-    overlay_margin: SpinButton,
-    crossfade_ms: SpinButton,
-    injection_enabled: CheckButton,
-    batch_mode: CheckButton,
-    char_delay_ms: SpinButton,
-    tray_enabled: CheckButton,
-    status: Label,
-}
-
-struct ProfileButtons {
-    new: Button,
-    duplicate: Button,
-    delete: Button,
-    save: Button,
-    apply: Button,
+    /// Guards signal handlers while rows are rebuilt programmatically.
+    updating: Cell<bool>,
+    /// Paths backing the rows of `model_picker`.
+    model_paths: RefCell<Vec<PathBuf>>,
+    profiles: adw::ComboRow,
+    model_picker: adw::ComboRow,
+    model_path: adw::EntryRow,
+    residency: adw::ComboRow,
+    threads: adw::SpinRow,
+    language: adw::EntryRow,
+    sample_rate: adw::SpinRow,
+    channels: adw::SpinRow,
+    vad_silence_ms: adw::SpinRow,
+    max_edit_seconds: adw::SpinRow,
+    stt_channel_capacity: adw::SpinRow,
+    node_name: adw::EntryRow,
+    overlay_enabled: adw::SwitchRow,
+    overlay_anchor: adw::ComboRow,
+    overlay_margin: adw::SpinRow,
+    crossfade_ms: adw::SpinRow,
+    injection_enabled: adw::SwitchRow,
+    batch_mode: adw::SwitchRow,
+    char_delay_ms: adw::SpinRow,
+    tray_enabled: adw::SwitchRow,
 }
 
 impl Form {
     fn new() -> Self {
+        let profiles = adw::ComboRow::new();
+        profiles.set_title("Profile");
+
+        let model_picker = adw::ComboRow::new();
+        model_picker.set_title("Installed Model");
+        model_picker.set_subtitle("Discovered in the models directory");
+
+        let model_path = entry_row("Model Path", "Path to the ggml Whisper model file (.bin)");
+
+        let residency = string_combo(&RESIDENCIES);
+        residency.set_title("Residency");
+        residency.set_subtitle("Preload at startup, or load lazily on first use");
+
+        let threads = spin_row("Threads", "Inference threads (0 = auto)", 0.0, 128.0, 1.0);
+        let language = entry_row(
+            "Language",
+            "Whisper language code such as \"en\" (empty = auto-detect)",
+        );
+
+        let sample_rate = spin_row(
+            "Sample Rate",
+            "Capture rate in Hz — Whisper expects 16000",
+            8_000.0,
+            96_000.0,
+            1_000.0,
+        );
+        let channels = spin_row(
+            "Channels",
+            "Captured audio channels (1 = mono)",
+            1.0,
+            8.0,
+            1.0,
+        );
+        let vad_silence_ms = spin_row(
+            "VAD Silence Gap",
+            "Silence in milliseconds that ends a speech chunk",
+            50.0,
+            10_000.0,
+            50.0,
+        );
+        let max_edit_seconds = spin_row(
+            "Edit Capture Limit",
+            "Maximum seconds kept for edit review",
+            1.0,
+            3_600.0,
+            1.0,
+        );
+        let stt_channel_capacity = spin_row(
+            "STT Queue Capacity",
+            "Audio chunks buffered for transcription",
+            1.0,
+            256.0,
+            1.0,
+        );
+        let node_name = entry_row(
+            "PipeWire Node",
+            "Optional PipeWire target node name (empty = default source)",
+        );
+
+        let overlay_enabled = switch_row("Enable Overlay", "Show the live transcription card");
+        let anchor_labels: Vec<&str> = ANCHORS.iter().map(|(_, label)| *label).collect();
+        let overlay_anchor = string_combo(&anchor_labels);
+        overlay_anchor.set_title("Anchor");
+        overlay_anchor.set_subtitle("Screen edge the overlay attaches to");
+        let overlay_margin = spin_row(
+            "Margin",
+            "Distance from the anchored edge in pixels",
+            0.0,
+            2_000.0,
+            1.0,
+        );
+        let crossfade_ms = spin_row(
+            "Preview Crossfade",
+            "Fade duration for preview text in milliseconds",
+            0.0,
+            5_000.0,
+            10.0,
+        );
+
+        let injection_enabled = switch_row(
+            "Enable Text Injection",
+            "Type transcriptions into the focused window",
+        );
+        let batch_mode = switch_row(
+            "Batch Committed Text",
+            "Inject committed text at once instead of per keystroke",
+        );
+        let char_delay_ms = spin_row(
+            "Character Delay",
+            "Delay between injected characters in milliseconds",
+            0.0,
+            1_000.0,
+            1.0,
+        );
+
+        let tray_enabled = switch_row("Enable Tray Icon", "Show a status icon in the system tray");
+
         Self {
-            profiles: ComboBoxText::new(),
-            active_badge: Label::new(None),
-            model_picker: combo(&[("", "No models discovered")]),
-            model_path: Entry::builder().hexpand(true).build(),
-            refresh_models: Button::with_label("Refresh models"),
-            residency: combo(&[("preload", "Preload"), ("lazy", "Lazy")]),
-            threads: SpinButton::with_range(0.0, 128.0, 1.0),
-            language: Entry::builder().hexpand(true).build(),
-            sample_rate: SpinButton::with_range(8_000.0, 96_000.0, 1_000.0),
-            channels: SpinButton::with_range(1.0, 8.0, 1.0),
-            vad_silence_ms: SpinButton::with_range(50.0, 10_000.0, 50.0),
-            max_edit_seconds: SpinButton::with_range(1.0, 3_600.0, 1.0),
-            stt_channel_capacity: SpinButton::with_range(1.0, 256.0, 1.0),
-            node_name: Entry::builder().hexpand(true).build(),
-            overlay_enabled: CheckButton::new(),
-            overlay_anchor: combo(&[
-                ("top", "Top"),
-                ("bottom", "Bottom"),
-                ("left", "Left"),
-                ("right", "Right"),
-                ("top_left", "Top left"),
-                ("top_right", "Top right"),
-                ("bottom_left", "Bottom left"),
-                ("bottom_right", "Bottom right"),
-                ("center", "Center"),
-            ]),
-            overlay_margin: SpinButton::with_range(0.0, 2_000.0, 1.0),
-            crossfade_ms: SpinButton::with_range(0.0, 5_000.0, 10.0),
-            injection_enabled: CheckButton::new(),
-            batch_mode: CheckButton::new(),
-            char_delay_ms: SpinButton::with_range(0.0, 1_000.0, 1.0),
-            tray_enabled: CheckButton::new(),
-            status: Label::new(None),
+            updating: Cell::new(false),
+            model_paths: RefCell::new(Vec::new()),
+            profiles,
+            model_picker,
+            model_path,
+            residency,
+            threads,
+            language,
+            sample_rate,
+            channels,
+            vad_silence_ms,
+            max_edit_seconds,
+            stt_channel_capacity,
+            node_name,
+            overlay_enabled,
+            overlay_anchor,
+            overlay_margin,
+            crossfade_ms,
+            injection_enabled,
+            batch_mode,
+            char_delay_ms,
+            tray_enabled,
         }
     }
 }
 
-fn build_ui(app: &Application) -> Result<()> {
+fn string_combo(items: &[&str]) -> adw::ComboRow {
+    let row = adw::ComboRow::new();
+    row.set_model(Some(&gtk4::StringList::new(items)));
+    row
+}
+
+fn spin_row(title: &str, subtitle: &str, min: f64, max: f64, step: f64) -> adw::SpinRow {
+    let row = adw::SpinRow::with_range(min, max, step);
+    row.set_title(title);
+    row.set_subtitle(subtitle);
+    row
+}
+
+fn switch_row(title: &str, subtitle: &str) -> adw::SwitchRow {
+    let row = adw::SwitchRow::new();
+    row.set_title(title);
+    row.set_subtitle(subtitle);
+    row
+}
+
+fn entry_row(title: &str, tooltip: &str) -> adw::EntryRow {
+    let row = adw::EntryRow::new();
+    row.set_title(title);
+    row.set_tooltip_text(Some(tooltip));
+    row
+}
+
+fn build_ui(app: &adw::Application) -> Result<()> {
     let store = ProfileStore::default();
     store
         .ensure_initialized()
@@ -134,7 +253,6 @@ fn build_ui(app: &Application) -> Result<()> {
         current: active,
         active: None,
         config,
-        loading_profile: Cell::new(false),
     }));
     let active_pointer = state.borrow().store.active()?;
     state.borrow_mut().active = active_pointer;
@@ -143,259 +261,253 @@ fn build_ui(app: &Application) -> Result<()> {
     populate_form(&form, &state.borrow().config);
     refresh_models(&form, &state.borrow().config);
 
-    let window = ApplicationWindow::builder()
+    let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("stt-settings")
-        .default_width(1_040)
-        .default_height(760)
+        .title("STT Settings")
+        .default_width(680)
+        .default_height(840)
         .build();
 
-    let header = HeaderBar::new();
-    header.set_title_widget(Some(&Label::new(Some("stt-settings"))));
-    window.set_titlebar(Some(&header));
+    // ── Header bar: window title plus the primary actions ────────────
+    let header = adw::HeaderBar::new();
+    header.set_title_widget(Some(&adw::WindowTitle::new("STT Settings", "")));
 
-    let root = GtkBox::new(Orientation::Vertical, 0);
-    root.set_vexpand(true);
+    let save_button = gtk4::Button::with_label("Save");
+    save_button.set_tooltip_text(Some("Save changes to the selected profile"));
+    let apply_button = gtk4::Button::with_label("Apply");
+    apply_button.set_tooltip_text(Some("Save and activate the selected profile"));
+    apply_button.add_css_class("suggested-action");
+    header.pack_end(&apply_button);
+    header.pack_end(&save_button);
 
-    let profile_bar = GtkBox::new(Orientation::Horizontal, 8);
-    profile_bar.set_margin_start(16);
-    profile_bar.set_margin_end(16);
-    profile_bar.set_margin_top(12);
-    profile_bar.set_margin_bottom(12);
-    profile_bar.append(&Label::new(Some("Profile")));
-    form.profiles.set_hexpand(false);
-    form.profiles.set_size_request(220, -1);
-    profile_bar.append(&form.profiles);
-    form.active_badge.set_xalign(0.0);
-    form.active_badge.set_hexpand(true);
-    profile_bar.append(&form.active_badge);
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
 
-    let buttons = ProfileButtons {
-        new: Button::with_label("New"),
-        duplicate: Button::with_label("Duplicate"),
-        delete: Button::with_label("Delete"),
-        save: Button::with_label("Save"),
-        apply: Button::with_label("Apply profile"),
-    };
-    profile_bar.append(&buttons.new);
-    profile_bar.append(&buttons.duplicate);
-    profile_bar.append(&buttons.delete);
-    profile_bar.append(&buttons.save);
-    profile_bar.append(&buttons.apply);
-    root.append(&profile_bar);
+    // ── Restart reminder, revealed after a profile is applied ────────
+    let banner = adw::Banner::new("Restart sttd to use the applied profile.");
+    banner.set_button_label(Some("Got It"));
+    banner.set_revealed(false);
+    banner.connect_button_clicked(|banner| banner.set_revealed(false));
+    toolbar.add_top_bar(&banner);
 
-    let scrolled = ScrolledWindow::builder()
-        .hscrollbar_policy(PolicyType::Never)
-        .vexpand(true)
-        .build();
-    let content = GtkBox::new(Orientation::Vertical, 14);
-    content.set_margin_start(16);
-    content.set_margin_end(16);
-    content.set_margin_bottom(20);
+    // ── Preferences page ─────────────────────────────────────────────
+    let page = adw::PreferencesPage::new();
 
-    let intro = Label::new(Some(
-        "Edit a profile, save it independently, then apply it to the daemon's active config.\nRestart sttd after applying changes.",
+    let profile_group = adw::PreferencesGroup::new();
+    profile_group.set_title("Profile");
+    profile_group.set_description(Some(
+        "Each profile holds a complete configuration. Save writes changes to the \
+         selected profile; Apply also makes it the daemon's active configuration.",
     ));
-    intro.set_xalign(0.0);
-    intro.set_wrap(true);
-    content.append(&intro);
+    let profile_menu = gio::Menu::new();
+    profile_menu.append(Some("New Profile…"), Some("win.new-profile"));
+    profile_menu.append(Some("Duplicate Profile"), Some("win.duplicate-profile"));
+    profile_menu.append(Some("Delete Profile…"), Some("win.delete-profile"));
+    let profile_menu_button = gtk4::MenuButton::builder()
+        .icon_name("open-menu-symbolic")
+        .menu_model(&profile_menu)
+        .tooltip_text("Profile actions")
+        .valign(gtk4::Align::Center)
+        .build();
+    profile_menu_button.add_css_class("flat");
+    form.profiles.add_suffix(&profile_menu_button);
+    profile_group.add(&form.profiles);
+    page.add(&profile_group);
 
-    let model_grid = grid();
-    add_row(&model_grid, 0, "Installed models", &form.model_picker);
-    let model_path_row = GtkBox::new(Orientation::Horizontal, 8);
-    model_path_row.append(&form.model_path);
-    model_path_row.append(&form.refresh_models);
-    add_row(&model_grid, 1, "Model path", &model_path_row);
-    add_row(&model_grid, 2, "Residency", &form.residency);
-    add_row(&model_grid, 3, "Whisper threads (0 = auto)", &form.threads);
-    add_row(&model_grid, 4, "Language", &form.language);
-    content.append(&section("Model", &model_grid));
+    let model_group = adw::PreferencesGroup::new();
+    model_group.set_title("Model");
+    let refresh_button = gtk4::Button::from_icon_name("view-refresh-symbolic");
+    refresh_button.set_tooltip_text(Some("Refresh the discovered model list"));
+    refresh_button.set_valign(gtk4::Align::Center);
+    refresh_button.add_css_class("flat");
+    form.model_picker.add_suffix(&refresh_button);
+    let browse_button = gtk4::Button::from_icon_name("document-open-symbolic");
+    browse_button.set_tooltip_text(Some("Browse for a model file"));
+    browse_button.set_valign(gtk4::Align::Center);
+    browse_button.add_css_class("flat");
+    form.model_path.add_suffix(&browse_button);
+    model_group.add(&form.model_picker);
+    model_group.add(&form.model_path);
+    model_group.add(&form.residency);
+    model_group.add(&form.threads);
+    model_group.add(&form.language);
+    page.add(&model_group);
 
-    let audio_grid = grid();
-    add_row(&audio_grid, 0, "Sample rate (Hz)", &form.sample_rate);
-    add_row(&audio_grid, 1, "Channels", &form.channels);
-    add_row(&audio_grid, 2, "VAD silence gap (ms)", &form.vad_silence_ms);
-    add_row(
-        &audio_grid,
-        3,
-        "Edit capture limit (seconds)",
-        &form.max_edit_seconds,
-    );
-    add_row(
-        &audio_grid,
-        4,
-        "STT queue capacity",
-        &form.stt_channel_capacity,
-    );
-    add_row(&audio_grid, 5, "PipeWire node (optional)", &form.node_name);
-    content.append(&section("Audio", &audio_grid));
+    let audio_group = adw::PreferencesGroup::new();
+    audio_group.set_title("Audio");
+    audio_group.add(&form.sample_rate);
+    audio_group.add(&form.channels);
+    audio_group.add(&form.vad_silence_ms);
+    audio_group.add(&form.max_edit_seconds);
+    audio_group.add(&form.stt_channel_capacity);
+    audio_group.add(&form.node_name);
+    page.add(&audio_group);
 
-    let overlay_grid = grid();
-    add_row(&overlay_grid, 0, "Enable overlay", &form.overlay_enabled);
-    add_row(&overlay_grid, 1, "Anchor", &form.overlay_anchor);
-    add_row(&overlay_grid, 2, "Margin (px)", &form.overlay_margin);
-    add_row(
-        &overlay_grid,
-        3,
-        "Preview crossfade (ms)",
-        &form.crossfade_ms,
-    );
-    content.append(&section("Overlay", &overlay_grid));
+    let overlay_group = adw::PreferencesGroup::new();
+    overlay_group.set_title("Overlay");
+    overlay_group.add(&form.overlay_enabled);
+    overlay_group.add(&form.overlay_anchor);
+    overlay_group.add(&form.overlay_margin);
+    overlay_group.add(&form.crossfade_ms);
+    page.add(&overlay_group);
 
-    let injection_grid = grid();
-    add_row(
-        &injection_grid,
-        0,
-        "Enable text injection",
-        &form.injection_enabled,
-    );
-    add_row(&injection_grid, 1, "Batch committed text", &form.batch_mode);
-    add_row(
-        &injection_grid,
-        2,
-        "Character delay (ms)",
-        &form.char_delay_ms,
-    );
-    content.append(&section("Injection", &injection_grid));
+    let injection_group = adw::PreferencesGroup::new();
+    injection_group.set_title("Injection");
+    injection_group.add(&form.injection_enabled);
+    injection_group.add(&form.batch_mode);
+    injection_group.add(&form.char_delay_ms);
+    page.add(&injection_group);
 
-    let tray_grid = grid();
-    add_row(&tray_grid, 0, "Enable tray icon", &form.tray_enabled);
-    content.append(&section("Tray", &tray_grid));
+    let tray_group = adw::PreferencesGroup::new();
+    tray_group.set_title("Tray");
+    tray_group.add(&form.tray_enabled);
+    page.add(&tray_group);
 
-    form.status.set_xalign(0.0);
-    form.status.set_wrap(true);
-    form.status.add_css_class("dim-label");
-    content.append(&form.status);
+    toolbar.set_content(Some(&page));
 
-    scrolled.set_child(Some(&content));
-    root.append(&scrolled);
-    window.set_child(Some(&root));
+    let toast_overlay = adw::ToastOverlay::new();
+    toast_overlay.set_child(Some(&toolbar));
+    window.set_content(Some(&toast_overlay));
 
-    connect_profile_signals(&window, &form, &state, &buttons);
-    refresh_profiles(&form, &state);
-    set_status(
+    connect_signals(
+        &window,
+        &toast_overlay,
+        &banner,
         &form,
-        "Ready. Select a profile or edit the current one.",
-        false,
+        &state,
+        &save_button,
+        &apply_button,
+        &refresh_button,
+        &browse_button,
     );
+
+    refresh_profiles(&form, &state);
     window.present();
     Ok(())
 }
 
-fn connect_profile_signals(
-    window: &ApplicationWindow,
+#[allow(clippy::too_many_arguments)]
+fn connect_signals(
+    window: &adw::ApplicationWindow,
+    overlay: &adw::ToastOverlay,
+    banner: &adw::Banner,
     form: &Rc<Form>,
     state: &Rc<RefCell<EditorState>>,
-    buttons: &ProfileButtons,
+    save_button: &gtk4::Button,
+    apply_button: &gtk4::Button,
+    refresh_button: &gtk4::Button,
+    browse_button: &gtk4::Button,
 ) {
+    // Selecting a profile loads it into the form.
     {
-        let state = Rc::clone(state);
         let form = Rc::clone(form);
-        let profile_combo = form.profiles.clone();
-        profile_combo.connect_changed(move |combo| {
-            if state.borrow().loading_profile.get() {
+        let state = Rc::clone(state);
+        let overlay = overlay.clone();
+        let profiles = form.profiles.clone();
+        profiles.connect_selected_notify(move |row| {
+            if form.updating.get() {
                 return;
             }
-            let Some(name) = combo.active_id().map(|id| id.to_string()) else {
+            let Some(name) = row
+                .selected_item()
+                .and_downcast::<gtk4::StringObject>()
+                .map(|item| item.string().to_string())
+            else {
                 return;
             };
-            load_profile(&form, &state, &name);
+            load_profile(&form, &state, &overlay, &name);
         });
     }
 
+    // Picking a discovered model fills in the model path entry.
     {
         let form = Rc::clone(form);
-        let model_picker = form.model_picker.clone();
-        model_picker.connect_changed(move |combo| {
-            if let Some(path) = combo.active_id() {
-                if !path.is_empty() {
-                    form.model_path.set_text(path.as_str());
+        let picker = form.model_picker.clone();
+        picker.connect_selected_notify(move |row| {
+            if form.updating.get() {
+                return;
+            }
+            let index = row.selected() as usize;
+            let path = form.model_paths.borrow().get(index).cloned();
+            if let Some(path) = path {
+                let text = path.to_string_lossy().into_owned();
+                if form.model_path.text().as_str() != text {
+                    form.model_path.set_text(&text);
                 }
             }
         });
     }
 
+    // Typing a path that matches a discovered model selects it.
+    {
+        let form = Rc::clone(form);
+        let entry = form.model_path.clone();
+        entry.connect_changed(move |row| {
+            if form.updating.get() {
+                return;
+            }
+            let text = row.text();
+            let paths = form.model_paths.borrow();
+            let index = paths
+                .iter()
+                .position(|path| path.to_string_lossy() == text.as_str());
+            let selected = index.map_or(gtk4::INVALID_LIST_POSITION, |index| index as u32);
+            if form.model_picker.selected() != selected {
+                form.model_picker.set_selected(selected);
+            }
+        });
+    }
+
     {
         let form = Rc::clone(form);
         let state = Rc::clone(state);
-        let refresh_button = form.refresh_models.clone();
+        let overlay = overlay.clone();
+        let refresh_button = refresh_button.clone();
         refresh_button.connect_clicked(move |_| {
             let mut cfg = state.borrow().config.clone();
             cfg.model.path = form.model_path.text().to_string();
             refresh_models(&form, &cfg);
-            set_status(&form, "Model list refreshed.", false);
+            toast(&overlay, "Model list refreshed.");
         });
     }
 
     {
         let form = Rc::clone(form);
-        let state = Rc::clone(state);
-        buttons.new.connect_clicked(move |_| {
-            let store = state.borrow().store.clone();
-            let name = unique_profile_name(&store, "New profile");
-            let cfg = collect_config(&state, &form);
-            match store.save(&name, &cfg) {
-                Ok(()) => {
-                    {
-                        let mut editor = state.borrow_mut();
-                        editor.current = name.clone();
-                        editor.config = cfg;
+        let window = window.clone();
+        browse_button.connect_clicked(move |_| {
+            let dialog = gtk4::FileDialog::new();
+            dialog.set_title("Select a Whisper Model");
+            dialog.set_modal(true);
+            let filter = gtk4::FileFilter::new();
+            filter.add_suffix("bin");
+            filter.set_name(Some("Whisper models (*.bin)"));
+            dialog.set_default_filter(Some(&filter));
+            let form = Rc::clone(&form);
+            dialog.open(Some(&window), gio::Cancellable::NONE, move |result| {
+                if let Ok(file) = result {
+                    if let Some(path) = file.path() {
+                        form.model_path.set_text(path.to_string_lossy().as_ref());
                     }
-                    refresh_profiles(&form, &state);
-                    set_status(&form, &format!("Created profile '{name}'."), false);
                 }
-                Err(error) => {
-                    set_status(&form, &format!("Could not create profile: {error:#}"), true)
-                }
-            }
+            });
         });
     }
 
     {
         let form = Rc::clone(form);
         let state = Rc::clone(state);
-        buttons.duplicate.connect_clicked(move |_| {
-            let store = state.borrow().store.clone();
-            let base = format!("{} Copy", state.borrow().current);
-            let name = unique_profile_name(&store, &base);
-            let cfg = collect_config(&state, &form);
-            match store.save(&name, &cfg) {
-                Ok(()) => {
-                    {
-                        let mut editor = state.borrow_mut();
-                        editor.current = name.clone();
-                        editor.config = cfg;
-                    }
-                    refresh_profiles(&form, &state);
-                    set_status(&form, &format!("Duplicated profile as '{name}'."), false);
-                }
-                Err(error) => set_status(
-                    &form,
-                    &format!("Could not duplicate profile: {error:#}"),
-                    true,
-                ),
-            }
-        });
-    }
-
-    {
-        let form = Rc::clone(form);
-        let state = Rc::clone(state);
-        buttons.save.connect_clicked(move |_| {
+        let overlay = overlay.clone();
+        save_button.connect_clicked(move |_| {
             let name = state.borrow().current.clone();
             let cfg = collect_config(&state, &form);
             let store = state.borrow().store.clone();
             match store.save(&name, &cfg) {
                 Ok(()) => {
                     state.borrow_mut().config = cfg;
-                    set_status(
-                        &form,
-                        &format!("Saved '{name}'. Apply it to make it active."),
-                        false,
-                    );
+                    toast(&overlay, &format!("Saved '{name}'."));
                 }
                 Err(error) => {
-                    set_status(&form, &format!("Could not save profile: {error:#}"), true)
+                    toast_error(&overlay, &format!("Could not save profile: {error:#}"));
                 }
             }
         });
@@ -404,7 +516,9 @@ fn connect_profile_signals(
     {
         let form = Rc::clone(form);
         let state = Rc::clone(state);
-        buttons.apply.connect_clicked(move |_| {
+        let overlay = overlay.clone();
+        let banner = banner.clone();
+        apply_button.connect_clicked(move |_| {
             let name = state.borrow().current.clone();
             let cfg = collect_config(&state, &form);
             let store = state.borrow().store.clone();
@@ -417,70 +531,206 @@ fn connect_profile_signals(
                         editor.active = Some(name.clone());
                     }
                     refresh_profiles(&form, &state);
-                    set_status(
-                        &form,
-                        &format!("Applied '{name}' to config.toml. Restart sttd to use it."),
-                        false,
-                    );
+                    banner.set_title(&format!("Applied '{name}'. Restart sttd to use it."));
+                    banner.set_revealed(true);
                 }
                 Err(error) => {
-                    set_status(&form, &format!("Could not apply profile: {error:#}"), true)
+                    toast_error(&overlay, &format!("Could not apply profile: {error:#}"));
                 }
             }
         });
     }
 
+    // Profile actions, registered on the window so the menu model reaches them.
+    let actions = gio::SimpleActionGroup::new();
+    window.insert_action_group("win", Some(&actions));
+
+    {
+        let window = window.clone();
+        let form = Rc::clone(form);
+        let state = Rc::clone(state);
+        let overlay = overlay.clone();
+        let action = gio::SimpleAction::new("new-profile", None);
+        action.connect_activate(move |_, _| {
+            prompt_new_profile(&window, &overlay, &form, &state);
+        });
+        actions.add_action(&action);
+    }
+
     {
         let form = Rc::clone(form);
         let state = Rc::clone(state);
-        let window = window.clone();
-        buttons.delete.connect_clicked(move |_| {
-            let name = state.borrow().current.clone();
-            let dialog = MessageDialog::new(
-                Some(&window),
-                DialogFlags::MODAL,
-                MessageType::Question,
-                gtk4::ButtonsType::OkCancel,
-                format!("Delete profile '{name}'?"),
-            );
-            let form = Rc::clone(&form);
-            let state = Rc::clone(&state);
-            dialog.connect_response(move |dialog, response| {
-                if response == ResponseType::Ok {
-                    let store = state.borrow().store.clone();
-                    match store.delete(&name) {
-                        Ok(()) => {
-                            let next = store.active().ok().flatten().or_else(|| {
-                                store.list().ok().and_then(|names| names.into_iter().next())
-                            });
-                            if let Some(next) = next {
-                                if let Ok(cfg) = store.load(&next) {
-                                    {
-                                        let mut editor = state.borrow_mut();
-                                        editor.current = next;
-                                        editor.config = cfg.clone();
-                                        editor.active = store.active().ok().flatten();
-                                    }
-                                    populate_form(&form, &cfg);
-                                    refresh_models(&form, &cfg);
-                                    refresh_profiles(&form, &state);
-                                }
-                            }
-                            set_status(&form, "Profile deleted.", false);
-                        }
-                        Err(error) => {
-                            set_status(&form, &format!("Could not delete profile: {error:#}"), true)
-                        }
+        let overlay = overlay.clone();
+        let action = gio::SimpleAction::new("duplicate-profile", None);
+        action.connect_activate(move |_, _| {
+            let store = state.borrow().store.clone();
+            let base = format!("{} Copy", state.borrow().current);
+            let name = unique_profile_name(&store, &base);
+            let cfg = collect_config(&state, &form);
+            match store.save(&name, &cfg) {
+                Ok(()) => {
+                    {
+                        let mut editor = state.borrow_mut();
+                        editor.current = name.clone();
+                        editor.config = cfg;
                     }
+                    refresh_profiles(&form, &state);
+                    toast(&overlay, &format!("Duplicated profile as '{name}'."));
                 }
-                dialog.close();
-            });
-            dialog.present();
+                Err(error) => {
+                    toast_error(&overlay, &format!("Could not duplicate profile: {error:#}"))
+                }
+            }
         });
+        actions.add_action(&action);
+    }
+
+    {
+        let window = window.clone();
+        let form = Rc::clone(form);
+        let state = Rc::clone(state);
+        let overlay = overlay.clone();
+        let action = gio::SimpleAction::new("delete-profile", None);
+        action.connect_activate(move |_, _| {
+            confirm_delete_profile(&window, &overlay, &form, &state);
+        });
+        actions.add_action(&action);
     }
 }
 
-fn load_profile(form: &Form, state: &Rc<RefCell<EditorState>>, name: &str) {
+fn prompt_new_profile(
+    window: &adw::ApplicationWindow,
+    overlay: &adw::ToastOverlay,
+    form: &Rc<Form>,
+    state: &Rc<RefCell<EditorState>>,
+) {
+    let dialog = adw::AlertDialog::new(
+        Some("New Profile"),
+        Some("Save the current settings as a new profile."),
+    );
+    let entry = gtk4::Entry::builder()
+        .placeholder_text("Profile name")
+        .activates_default(true)
+        .build();
+    dialog.set_extra_child(Some(&entry));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("create", "Create");
+    dialog.set_response_appearance("create", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("create"));
+    dialog.set_close_response("cancel");
+
+    let form = Rc::clone(form);
+    let state = Rc::clone(state);
+    let overlay = overlay.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response != "create" {
+            return;
+        }
+        let name = entry.text();
+        create_profile(&overlay, &form, &state, name.trim());
+    });
+    dialog.present(Some(window));
+}
+
+fn create_profile(
+    overlay: &adw::ToastOverlay,
+    form: &Rc<Form>,
+    state: &Rc<RefCell<EditorState>>,
+    name: &str,
+) {
+    if name.is_empty() {
+        toast_error(overlay, "Profile name cannot be empty.");
+        return;
+    }
+    let store = state.borrow().store.clone();
+    if store
+        .list()
+        .map(|names| names.iter().any(|existing| existing == name))
+        .unwrap_or(false)
+    {
+        toast_error(
+            overlay,
+            &format!("A profile named '{name}' already exists."),
+        );
+        return;
+    }
+    let cfg = collect_config(state, form);
+    match store.save(name, &cfg) {
+        Ok(()) => {
+            {
+                let mut editor = state.borrow_mut();
+                editor.current = name.to_string();
+                editor.config = cfg;
+            }
+            refresh_profiles(form, state);
+            toast(overlay, &format!("Created profile '{name}'."));
+        }
+        Err(error) => toast_error(overlay, &format!("Could not create profile: {error:#}")),
+    }
+}
+
+fn confirm_delete_profile(
+    window: &adw::ApplicationWindow,
+    overlay: &adw::ToastOverlay,
+    form: &Rc<Form>,
+    state: &Rc<RefCell<EditorState>>,
+) {
+    let name = state.borrow().current.clone();
+    let heading = format!("Delete Profile '{name}'?");
+    let dialog = adw::AlertDialog::new(
+        Some(heading.as_str()),
+        Some("This permanently removes the profile from disk."),
+    );
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("delete", "Delete");
+    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+
+    let form = Rc::clone(form);
+    let state = Rc::clone(state);
+    let overlay = overlay.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response != "delete" {
+            return;
+        }
+        let store = state.borrow().store.clone();
+        match store.delete(&name) {
+            Ok(()) => {
+                let next = store
+                    .active()
+                    .ok()
+                    .flatten()
+                    .or_else(|| store.list().ok().and_then(|names| names.into_iter().next()));
+                if let Some(next) = next {
+                    if let Ok(cfg) = store.load(&next) {
+                        {
+                            let mut editor = state.borrow_mut();
+                            editor.current = next;
+                            editor.config = cfg.clone();
+                            editor.active = store.active().ok().flatten();
+                        }
+                        populate_form(&form, &cfg);
+                        refresh_models(&form, &cfg);
+                        refresh_profiles(&form, &state);
+                    }
+                }
+                toast(&overlay, "Profile deleted.");
+            }
+            Err(error) => {
+                toast_error(&overlay, &format!("Could not delete profile: {error:#}"));
+            }
+        }
+    });
+    dialog.present(Some(window));
+}
+
+fn load_profile(
+    form: &Rc<Form>,
+    state: &Rc<RefCell<EditorState>>,
+    overlay: &adw::ToastOverlay,
+    name: &str,
+) {
     let store = state.borrow().store.clone();
     match store.load(name) {
         Ok(cfg) => {
@@ -491,13 +741,13 @@ fn load_profile(form: &Form, state: &Rc<RefCell<EditorState>>, name: &str) {
             }
             populate_form(form, &cfg);
             refresh_models(form, &cfg);
-            set_status(form, &format!("Loaded '{name}'."), false);
+            toast(overlay, &format!("Loaded '{name}'."));
         }
-        Err(error) => set_status(form, &format!("Could not load profile: {error:#}"), true),
+        Err(error) => toast_error(overlay, &format!("Could not load profile: {error:#}")),
     }
 }
 
-fn refresh_profiles(form: &Form, state: &Rc<RefCell<EditorState>>) {
+fn refresh_profiles(form: &Rc<Form>, state: &Rc<RefCell<EditorState>>) {
     let (store, current, active) = {
         let editor = state.borrow();
         (
@@ -509,26 +759,25 @@ fn refresh_profiles(form: &Form, state: &Rc<RefCell<EditorState>>) {
     let names = match store.list() {
         Ok(names) => names,
         Err(error) => {
-            set_status(form, &format!("Could not list profiles: {error:#}"), true);
+            form.profiles
+                .set_subtitle(&format!("Could not list profiles: {error:#}"));
             return;
         }
     };
 
-    state.borrow().loading_profile.set(true);
-    form.profiles.remove_all();
-    for name in names {
-        let label = if active.as_deref() == Some(name.as_str()) {
-            format!("{name} (active)")
-        } else {
-            name.clone()
-        };
-        form.profiles.append(Some(&name), &label);
+    form.updating.set(true);
+    let model = gtk4::StringList::new(&[]);
+    for name in &names {
+        model.append(name);
     }
-    form.profiles.set_active_id(Some(&current));
-    state.borrow().loading_profile.set(false);
-    form.active_badge.set_text(
+    form.profiles.set_model(Some(&model));
+    let index = names.iter().position(|name| name == &current).unwrap_or(0) as u32;
+    form.profiles.set_selected(index);
+    form.updating.set(false);
+
+    form.profiles.set_subtitle(
         &active
-            .map(|name| format!("Active: {name}"))
+            .map(|name| format!("Active profile: {name}"))
             .unwrap_or_else(|| "No active profile".into()),
     );
 }
@@ -561,23 +810,33 @@ fn refresh_models(form: &Form, cfg: &Config) {
         paths.insert(PathBuf::from(&current));
     }
 
-    form.model_picker.remove_all();
+    form.updating.set(true);
+    let model = gtk4::StringList::new(&[]);
+    let mut list = Vec::with_capacity(paths.len());
     if paths.is_empty() {
-        form.model_picker.append(Some(""), "No .bin models found");
+        model.append("No .bin models found");
     } else {
-        for path in paths {
-            let id = path.to_string_lossy().into_owned();
+        for path in &paths {
             let label = path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .unwrap_or(&id)
-                .to_string();
-            form.model_picker.append(Some(&id), &label);
+                .map(str::to_string)
+                .unwrap_or_else(|| path.to_string_lossy().into_owned());
+            model.append(&label);
+            list.push(path.clone());
         }
     }
-    if !current.is_empty() {
-        form.model_picker.set_active_id(Some(&current));
-    }
+    form.model_picker.set_model(Some(&model));
+    *form.model_paths.borrow_mut() = list;
+
+    let selected = form
+        .model_paths
+        .borrow()
+        .iter()
+        .position(|path| path.to_string_lossy().as_ref() == current)
+        .map_or(gtk4::INVALID_LIST_POSITION, |index| index as u32);
+    form.model_picker.set_selected(selected);
+    form.updating.set(false);
 }
 
 fn collect_config(state: &Rc<RefCell<EditorState>>, form: &Form) -> Config {
@@ -586,43 +845,47 @@ fn collect_config(state: &Rc<RefCell<EditorState>>, form: &Form) -> Config {
     if let Some(name) = Path::new(&cfg.model.path).file_name() {
         cfg.model.name = name.to_string_lossy().into_owned();
     }
-    cfg.model.residency = match combo_id(&form.residency).as_deref() {
-        Some("lazy") => ModelResidency::Lazy,
-        _ => ModelResidency::Preload,
+    cfg.model.residency = if form.residency.selected() == 1 {
+        ModelResidency::Lazy
+    } else {
+        ModelResidency::Preload
     };
-    cfg.model.threads = nonnegative_u32(&form.threads);
+    cfg.model.threads = spin_u32(&form.threads);
     cfg.model.language = form.language.text().to_string();
 
-    cfg.audio.sample_rate = nonnegative_u32(&form.sample_rate);
-    cfg.audio.channels = nonnegative_u32(&form.channels) as u16;
-    cfg.audio.vad_silence_ms = nonnegative_u32(&form.vad_silence_ms);
+    cfg.audio.sample_rate = spin_u32(&form.sample_rate);
+    cfg.audio.channels = spin_u32(&form.channels) as u16;
+    cfg.audio.vad_silence_ms = spin_u32(&form.vad_silence_ms);
     cfg.audio.silence_gap_ms = cfg.audio.vad_silence_ms;
-    cfg.audio.max_edit_seconds = nonnegative_u32(&form.max_edit_seconds);
-    cfg.audio.stt_channel_capacity = nonnegative_u32(&form.stt_channel_capacity) as usize;
+    cfg.audio.max_edit_seconds = spin_u32(&form.max_edit_seconds);
+    cfg.audio.stt_channel_capacity = spin_u32(&form.stt_channel_capacity) as usize;
     cfg.audio.node_name = nonempty(form.node_name.text().as_str());
 
     cfg.overlay.enabled = form.overlay_enabled.is_active();
-    cfg.overlay.anchor = overlay_anchor(combo_id(&form.overlay_anchor).as_deref());
-    cfg.overlay.margin = nonnegative_u32(&form.overlay_margin) as i32;
-    cfg.overlay.crossfade_ms = nonnegative_u32(&form.crossfade_ms);
+    cfg.overlay.anchor = ANCHORS
+        .get(form.overlay_anchor.selected() as usize)
+        .map(|(anchor, _)| *anchor)
+        .unwrap_or(OverlayAnchor::Bottom);
+    cfg.overlay.margin = spin_u32(&form.overlay_margin) as i32;
+    cfg.overlay.crossfade_ms = spin_u32(&form.crossfade_ms);
     cfg.overlay.preview_crossfade_ms = cfg.overlay.crossfade_ms;
     cfg.overlay.edit_buffer_cap_secs = cfg.audio.max_edit_seconds;
 
     cfg.injection.enabled = form.injection_enabled.is_active();
     cfg.injection.batch_mode = form.batch_mode.is_active();
-    cfg.injection.char_delay_ms = nonnegative_u32(&form.char_delay_ms);
+    cfg.injection.char_delay_ms = spin_u32(&form.char_delay_ms);
     cfg.tray.enabled = form.tray_enabled.is_active();
     cfg.normalize();
     cfg
 }
 
 fn populate_form(form: &Form, cfg: &Config) {
+    form.updating.set(true);
     form.model_path.set_text(&cfg.model.path);
-    form.residency
-        .set_active_id(Some(match cfg.model.residency {
-            ModelResidency::Preload => "preload",
-            ModelResidency::Lazy => "lazy",
-        }));
+    form.residency.set_selected(match cfg.model.residency {
+        ModelResidency::Preload => 0,
+        ModelResidency::Lazy => 1,
+    });
     form.threads.set_value(cfg.model.threads as f64);
     form.language.set_text(&cfg.model.language);
 
@@ -638,8 +901,11 @@ fn populate_form(form: &Form, cfg: &Config) {
         .set_text(cfg.audio.node_name.as_deref().unwrap_or(""));
 
     form.overlay_enabled.set_active(cfg.overlay.enabled);
-    form.overlay_anchor
-        .set_active_id(Some(overlay_anchor_id(cfg.overlay.anchor)));
+    let anchor_index = ANCHORS
+        .iter()
+        .position(|(anchor, _)| *anchor == cfg.overlay.anchor)
+        .unwrap_or(1) as u32;
+    form.overlay_anchor.set_selected(anchor_index);
     form.overlay_margin
         .set_value(cfg.overlay.margin.max(0) as f64);
     form.crossfade_ms.set_value(cfg.overlay.crossfade_ms as f64);
@@ -649,84 +915,16 @@ fn populate_form(form: &Form, cfg: &Config) {
     form.char_delay_ms
         .set_value(cfg.injection.char_delay_ms as f64);
     form.tray_enabled.set_active(cfg.tray.enabled);
+    form.updating.set(false);
 }
 
-fn combo(items: &[(&str, &str)]) -> ComboBoxText {
-    let combo = ComboBoxText::new();
-    for (id, label) in items {
-        combo.append(Some(id), label);
-    }
-    if let Some((id, _)) = items.first() {
-        combo.set_active_id(Some(id));
-    }
-    combo
-}
-
-fn grid() -> Grid {
-    let grid = Grid::new();
-    grid.set_column_spacing(24);
-    grid.set_row_spacing(8);
-    grid.set_column_homogeneous(false);
-    grid
-}
-
-fn add_row<W: IsA<gtk4::Widget>>(grid: &Grid, row: i32, text: &str, widget: &W) {
-    let label = Label::new(Some(text));
-    label.set_xalign(0.0);
-    label.set_hexpand(true);
-    grid.attach(&label, 0, row, 1, 1);
-    grid.attach(widget, 1, row, 1, 1);
-}
-
-fn section(title: &str, grid: &Grid) -> Frame {
-    let frame = Frame::new(Some(title));
-    frame.set_margin_top(2);
-    frame.set_margin_bottom(2);
-    frame.set_margin_start(2);
-    frame.set_margin_end(2);
-    frame.set_child(Some(grid));
-    frame
-}
-
-fn combo_id(combo: &ComboBoxText) -> Option<String> {
-    combo.active_id().map(|id| id.to_string())
-}
-
-fn nonnegative_u32(spin: &SpinButton) -> u32 {
-    spin.value_as_int().max(0) as u32
+fn spin_u32(spin: &adw::SpinRow) -> u32 {
+    spin.value().max(0.0) as u32
 }
 
 fn nonempty(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
-}
-
-fn overlay_anchor(value: Option<&str>) -> OverlayAnchor {
-    match value {
-        Some("top") => OverlayAnchor::Top,
-        Some("left") => OverlayAnchor::Left,
-        Some("right") => OverlayAnchor::Right,
-        Some("top_left") => OverlayAnchor::TopLeft,
-        Some("top_right") => OverlayAnchor::TopRight,
-        Some("bottom_left") => OverlayAnchor::BottomLeft,
-        Some("bottom_right") => OverlayAnchor::BottomRight,
-        Some("center") => OverlayAnchor::Center,
-        _ => OverlayAnchor::Bottom,
-    }
-}
-
-fn overlay_anchor_id(anchor: OverlayAnchor) -> &'static str {
-    match anchor {
-        OverlayAnchor::Top => "top",
-        OverlayAnchor::Bottom => "bottom",
-        OverlayAnchor::Left => "left",
-        OverlayAnchor::Right => "right",
-        OverlayAnchor::TopLeft => "top_left",
-        OverlayAnchor::TopRight => "top_right",
-        OverlayAnchor::BottomLeft => "bottom_left",
-        OverlayAnchor::BottomRight => "bottom_right",
-        OverlayAnchor::Center => "center",
-    }
 }
 
 fn unique_profile_name(store: &ProfileStore, base: &str) -> String {
@@ -743,31 +941,28 @@ fn unique_profile_name(store: &ProfileStore, base: &str) -> String {
     format!("Profile {}", names.len() + 1)
 }
 
-fn set_status(form: &Form, message: &str, error: bool) {
-    form.status.set_text(message);
-    if error {
-        form.status.add_css_class("error");
-    } else {
-        form.status.remove_css_class("error");
-    }
+fn toast(overlay: &adw::ToastOverlay, message: &str) {
+    overlay.add_toast(adw::Toast::new(message));
 }
 
-fn show_startup_error(app: &Application, error: &anyhow::Error) {
-    let window = ApplicationWindow::builder()
+fn toast_error(overlay: &adw::ToastOverlay, message: &str) {
+    overlay.add_toast(adw::Toast::builder().title(message).timeout(6).build());
+}
+
+fn show_startup_error(app: &adw::Application, error: &anyhow::Error) {
+    let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("stt-settings error")
-        .default_width(520)
-        .default_height(180)
+        .title("STT Settings")
+        .default_width(480)
+        .default_height(320)
         .build();
-    let box_ = GtkBox::new(Orientation::Vertical, 12);
-    box_.set_margin_start(20);
-    box_.set_margin_end(20);
-    box_.set_margin_top(20);
-    box_.set_margin_bottom(20);
-    let label = Label::new(Some(&format!("Could not open stt-settings:\n{error:#}")));
-    label.set_wrap(true);
-    label.set_xalign(0.0);
-    box_.append(&label);
-    window.set_child(Some(&box_));
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    let status = adw::StatusPage::new();
+    status.set_icon_name(Some("dialog-error-symbolic"));
+    status.set_title("Could Not Open Settings");
+    status.set_description(Some(&format!("{error:#}")));
+    toolbar.set_content(Some(&status));
+    window.set_content(Some(&toolbar));
     window.present();
 }

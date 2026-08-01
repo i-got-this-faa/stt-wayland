@@ -42,10 +42,11 @@ pipewire = "0.9"
 webrtc-vad = "0.4"
 whisper-rs = "0.16"
 
-# GUI overlay — keep gtk4 / gtk4-layer-shell / glib on a matched gtk-rs line.
-gtk4 = "0.9"
+# GUI overlay — keep gtk4 / gtk4-layer-shell / glib / libadwaita on a matched gtk-rs line.
+gtk4 = { version = "0.9", features = ["v4_10"] }
 gtk4-layer-shell = "0.4"
 glib = "0.20"
+adw = { version = "0.7", package = "libadwaita", features = ["v1_5"] }
 
 # Wayland injection (virtual-keyboard-unstable-v1)
 wayland-client = "0.31"

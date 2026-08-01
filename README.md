@@ -6,7 +6,7 @@ Local, privacy-preserving **Wayland speech-to-text daemon** for Linux desktops (
 |-----------|------|
 | **sttd** | Session daemon: PipeWire capture → webrtc-vad → whisper.cpp → overlay + tray + virtual-keyboard inject |
 | **sttctl** | CLI control client (`start` / `stop` / `toggle` / …) |
-| **stt-settings** | GTK4 profile editor for models and daemon configuration |
+| **stt-settings** | GTK4/libadwaita profile editor for models and daemon configuration |
 | **proto** | Shared newline-delimited JSON IPC types |
 
 **No cloud STT.** Models are on-device (`base.en` / `small.en` via [whisper-rs](https://crates.io/crates/whisper-rs) / whisper.cpp). Native Wayland only (no X11 injection helpers, no Wine).
@@ -145,10 +145,10 @@ See [`contrib/config.example.toml`](contrib/config.example.toml). Sections:
 Launch `stt-settings` to manage named profiles under
 `~/.config/sttd/profiles/`. It discovers local `.bin` Whisper models and edits
 the model, audio/VAD, overlay, injection, and tray settings. **Save** updates
-only the selected profile; **Apply profile** also mirrors it to
+only the selected profile; **Apply** also mirrors it to
 `~/.config/sttd/config.toml` for the existing systemd unit. Restart `sttd` after
-applying a profile. Use **Refresh models** after adding a model while the editor
-is open.
+applying a profile. Use the refresh button next to the model list after adding
+a model while the editor is open.
 
 The daemon can also use a profile directly without changing the active config:
 
@@ -203,9 +203,9 @@ Socket: `$XDG_RUNTIME_DIR/sttd.sock`.
 
 Idle behaviour: no PipeWire stream and no mapped overlay surface (GTK runtime stays warm on its thread).
 
-Settings GUI: `stt-settings` is a separate GTK4 application and does not need
-the daemon to be running. Profile changes are persisted atomically; switching
-profiles affects the next daemon start/restart.
+Settings GUI: `stt-settings` is a separate GTK4/libadwaita application and does
+not need the daemon to be running. Profile changes are persisted atomically;
+switching profiles affects the next daemon start/restart.
 
 Tray behaviour: when enabled, `sttd` registers a StatusNotifierItem on the
 session D-Bus. The icon shows idle, recording, paused, or error state; a

@@ -1,6 +1,6 @@
 # stt-wayland — STATUS
 
-Last verified: 2026-07-24 (workspace on Linux, Wayland session present).
+Last verified: 2026-08-01 (workspace on Linux, Wayland session present).
 
 ## What works (build / unit / IPC)
 
@@ -8,6 +8,7 @@ Last verified: 2026-07-24 (workspace on Linux, Wayland session present).
 |------|--------|
 | `cargo check --workspace` | **OK** (default features) |
 | `cargo build --workspace` | **OK** → `target/debug/sttd`, `target/debug/sttctl` |
+| `cargo build --workspace --release` | **OK** → release binaries build successfully |
 | `cargo check -p sttd --no-default-features` | **OK** (stub backends; no system GUI/audio required) |
 | `cargo test -p proto` | **OK** (25 tests + 1 doctest) |
 | `cargo test --workspace` | **OK** (proto + sttd unit tests: state, config, vad, stt helpers, inject probe) |
@@ -15,10 +16,11 @@ Last verified: 2026-07-24 (workspace on Linux, Wayland session present).
 | Daemon IPC smoke (custom `--socket`) | **OK** — bind listen, `status` / `start` / `stop` NDJSON round-trips |
 | Inject probe on this host | **OK** — `inject_available: true` (virtual-keyboard-unstable-v1 bound) |
 | Overlay GTK warm-up | **OK** — GTK thread starts; CSS load clean after removing invalid `spacing` rules |
+| Release speech pipeline | **OK** — sample speech passed through PipeWire/VAD/Whisper and appeared in a focused Wayland text field |
 
 ## What needs system deps / assets (not a compile failure here)
 
-This environment already has **libpipewire**, **gtk4**, **cmake/clang** (whisper-rs built), and a **Wayland** display. Still required for *end-to-end speech*:
+This environment already has **libpipewire**, **gtk4**, **cmake/clang** (whisper-rs built), a **Wayland** display, and the model below. On another machine, the following runtime dependencies are still required for *end-to-end speech*:
 
 ### Whisper model (runtime)
 
@@ -31,7 +33,7 @@ curl -L -o ~/.local/share/sttd/models/ggml-base.en.bin \
 # optional: ggml-small.en.bin
 ```
 
-Without the model file, the daemon starts, surfaces a clear status `error`, and **Start** returns `error` (preload falls back to lazy; first Start still fails until the file exists).
+Without the model file, the daemon starts, surfaces a clear status `error`, and **Start** returns `error` (preload falls back to lazy; first Start still fails until the file exists). It is installed here at `/home/radhey/.local/share/sttd/models/ggml-base.en.bin`.
 
 ### Distro packages (if building on a clean machine)
 
@@ -54,16 +56,22 @@ cargo build --release                       # full daemon
 - **gtk4-layer-shell** (wlr-layer-shell) for overlay
 - **virtual-keyboard-unstable-v1** for injection (missing → status error string; capture still allowed)
 
-## Runtime tests intentionally **not** claimed here
+## Runtime validation
 
-The following were **not** fully validated on this pass (no model file; no long speech session):
+The bundled release daemon was validated on this Wayland session with the
+official `ggml-base.en.bin` model installed at the default path:
 
-- Live mic → VAD close → whisper commit → keyboard inject into a focused client
-- Edit mode full-buffer STT → EditReview TextView edit → Copy inject
-- Overlay visual crossfade / pause UI during real capture
-- PipeWire non-default node selection under load
+- Live audio from an explicit PipeWire source was chunked by VAD, transcribed
+  by Whisper, and injected into a focused GTK text field.
+- `start`, `stop`, `toggle`, `pause`, `resume`, `status`, and edit-review IPC
+  paths were exercised.
+- Overlay positioning was checked visually; the default bottom card is
+  centered.
+- A second daemon correctly refuses an already-active socket.
 
-Daemon *did* start under Wayland and reported inject ready; that is **not** the same as proving text appeared in an app.
+Manual microphone quality, edit-review text editing/copy, and non-default
+device selection still depend on the user’s preferred application and audio
+hardware.
 
 ## Architecture vs remaining TODOs
 
@@ -72,20 +80,17 @@ Implemented wiring matches v1 design:
 - Unix socket `$XDG_RUNTIME_DIR/sttd.sock`, NDJSON `proto` (`Start/Stop/Toggle/SetMode/Pause/Resume/Status`)
 - States: Idle / Recording / Paused / EditReview × Live|Edit
 - PipeWire mono 16 kHz f32; open on Start, close on Stop; Pause = stop feeding VAD
-- webrtc-vad ~500 ms silence gap; bounded STT command channel + backpressure drops
+- webrtc-vad ~500 ms silence gap; bounded final STT channel with coalesced,
+  lossy preview work
 - whisper-rs worker thread; preload|lazy residency
 - Live: commit+inject per chunk; preview overlay-only (throttled)
 - Edit: accumulate → full STT → EditReview; Copy/Discard
 - Overlay: Layer::Overlay; keyboard None recording; OnDemand EditReview only
 - Inject: virtual-keyboard-unstable-v1 via wayland-client (not wtype/ydotool)
 
-Possible follow-ups (not blockers for compile):
+Possible follow-ups (not blockers for normal use):
 
-1. Install model + run a real Live inject demo in a focused terminal.
-2. Align `contrib/config.example.toml` keys fully with section-11 names (`vad_silence_ms`, `crossfade_ms`, `path`) — aliases already work.
-3. Optional: map overlay `anchor` from config into `OverlayLayout` (layout defaults are hard-coded bottom-stretch today).
-4. Live preview STT competes with LiveChunk on the same worker queue — under heavy load, previews may starve; acceptable for v1.
-5. First-run helper: copy example config / print model download URL when file missing.
+1. First-run helper: copy example config / print model download URL when the file is missing.
 
 ## How to bind a key
 

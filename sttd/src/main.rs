@@ -26,7 +26,9 @@ mod state;
 mod stt;
 mod vad;
 
-use std::path::PathBuf;
+use std::os::unix::fs::FileTypeExt;
+use std::os::unix::net::UnixStream as StdUnixStream;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::Arc;
@@ -47,7 +49,7 @@ use crate::inject::Injector;
 use crate::overlay::{ChannelControlSink, ControlEvent, OverlayHandle};
 use crate::state::{AppState, SetModeResult, StartResult, StopResult};
 use crate::stt::{SttCommand, SttEngine, TranscriptResult};
-use crate::vad::{Chunker, SpeechPending, SAMPLE_RATE_HZ, DEFAULT_FRAME_MS};
+use crate::vad::{Chunker, SpeechPending, DEFAULT_FRAME_MS, SAMPLE_RATE_HZ};
 
 // ─── CLI ────────────────────────────────────────────────────────────────────
 
@@ -103,7 +105,9 @@ enum PipeEvent {
 /// Core → VAD/STT pipeline thread.
 enum PipeCmd {
     /// Begin feeding VAD for a new session.
-    Arm { mode: Mode },
+    Arm {
+        mode: Mode,
+    },
     /// Disarm + flush open utterance; for Edit, return full session buffer.
     Flush {
         reply: Sender<Option<Vec<f32>>>,
@@ -172,17 +176,7 @@ async fn async_main(cfg: Config, socket: PathBuf) -> Result<()> {
 
     let mut daemon = Daemon::bootstrap(cfg).context("bootstrap daemon")?;
 
-    if socket.exists() {
-        if let Err(e) = std::fs::remove_file(&socket) {
-            warn!(path = %socket.display(), error = %e, "failed to remove stale socket");
-        } else {
-            debug!(path = %socket.display(), "removed stale socket");
-        }
-    }
-    if let Some(parent) = socket.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create socket dir {}", parent.display()))?;
-    }
+    prepare_socket_path(&socket)?;
 
     let listener = UnixListener::bind(&socket)
         .with_context(|| format!("bind Unix socket {}", socket.display()))?;
@@ -289,6 +283,50 @@ async fn shutdown_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
+}
+
+/// Prepare a Unix socket path without stealing an active daemon's endpoint.
+///
+/// A stale socket is safe to remove after a timed connect refuses the
+/// connection. Regular files and active sockets are never overwritten.
+fn prepare_socket_path(socket: &Path) -> Result<()> {
+    if let Ok(metadata) = std::fs::symlink_metadata(socket) {
+        if !metadata.file_type().is_socket() {
+            bail!(
+                "socket path {} exists and is not a Unix socket",
+                socket.display()
+            );
+        }
+
+        match StdUnixStream::connect(socket) {
+            Ok(_) => bail!(
+                "another sttd instance is already listening at {}",
+                socket.display()
+            ),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                std::fs::remove_file(socket)
+                    .with_context(|| format!("remove stale socket {}", socket.display()))?;
+                debug!(path = %socket.display(), "removed stale socket");
+            }
+            Err(err) => {
+                bail!("cannot inspect existing socket {}: {err}", socket.display());
+            }
+        }
+    }
+
+    if let Some(parent) = socket.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create socket dir {}", parent.display()))?;
+    }
+    Ok(())
 }
 
 async fn handle_client(stream: UnixStream, core_tx: Sender<CoreEvent>) -> Result<()> {
@@ -418,6 +456,7 @@ impl Daemon {
         let (pipe_cmd_tx, pipe_cmd_rx) = mpsc::channel::<PipeCmd>();
         let (pipe_ev_tx, pipe_ev_rx) = mpsc::channel::<PipeEvent>();
         let stt_cmd = stt.command_sender();
+        let stt_preview = stt.preview_sender();
 
         let pipe_join = thread::Builder::new()
             .name("sttd-pipeline".into())
@@ -426,6 +465,7 @@ impl Daemon {
                     sample_rx,
                     silence_gap_ms,
                     stt_cmd,
+                    stt_preview,
                     pipe_cmd_rx,
                     pipe_ev_tx,
                     max_edit_samples,
@@ -620,6 +660,10 @@ impl Daemon {
     // ── transitions (single path) ─────────────────────────────────────────
 
     fn do_start(&mut self, mode: Mode) -> Result<()> {
+        let previous_state = self.state.state;
+        let previous_mode = self.state.mode;
+        let previous_edit_buffer = self.state.edit_buffer.clone();
+
         match self.state.start(mode) {
             StartResult::AlreadyRecording => {
                 debug!("start while recording — no-op Ok");
@@ -627,6 +671,24 @@ impl Daemon {
             }
             StartResult::Resumed => {
                 // Paused → Recording: re-enable feeding only.
+                if previous_mode != self.state.mode {
+                    // A paused session can be explicitly retargeted with
+                    // `start --mode`; discard partial VAD/STT continuity so
+                    // the new mode starts at a clean boundary.
+                    self.stt.cancel_previews();
+                    if let Err(e) = self.stt.wait_idle(Duration::from_secs(30)) {
+                        self.state.state = previous_state;
+                        self.state.mode = previous_mode;
+                        self.state.edit_buffer = previous_edit_buffer;
+                        self.state
+                            .set_error(format!("stt worker unavailable: {e:#}"));
+                        return Err(e).context("retarget paused session");
+                    }
+                    let _ = self.stt.reset_session();
+                    self.pipe_cmd(PipeCmd::Reset);
+                    self.pipe_cmd(PipeCmd::SetMode(mode));
+                    self.stt.resume_previews();
+                }
                 self.audio.resume_feed();
                 self.overlay.set_paused(false);
                 info!(?mode, "resumed");
@@ -635,13 +697,31 @@ impl Daemon {
             StartResult::Started => {}
         }
 
+        // Preview work is lossy. Cancel it before model/session commands so a
+        // new session cannot inherit stale preview jobs from the old one.
+        self.stt.cancel_previews();
+
         // Ensure model for lazy residency / prior preload failure.
         if let Err(e) = self.stt.ensure_loaded() {
-            // Roll state back to Idle on failure.
-            self.state.state = DaemonState::Idle;
+            // Keep an EditReview usable if a new start cannot load the model.
+            self.state.state = previous_state;
+            self.state.mode = previous_mode;
+            self.state.edit_buffer = previous_edit_buffer;
             self.state.set_error(format!("model load failed: {e:#}"));
             return Err(e).context("ensure whisper model loaded");
         }
+
+        let _ = self.stt.reset_session();
+        if let Err(e) = self.stt.wait_idle(Duration::from_secs(30)) {
+            self.state.state = previous_state;
+            self.state.mode = previous_mode;
+            self.state.edit_buffer = previous_edit_buffer;
+            self.state
+                .set_error(format!("stt worker unavailable: {e:#}"));
+            return Err(e).context("prepare stt worker");
+        }
+        self.stt.resume_previews();
+
         // Clear model errors once load succeeds.
         if self
             .state
@@ -657,13 +737,19 @@ impl Daemon {
             // show_live will replace; destroy first for cleanliness.
         }
 
-        let _ = self.stt.reset_session();
         self.pipe_cmd(PipeCmd::Reset);
         self.pipe_cmd(PipeCmd::Arm { mode });
 
-        self.audio
-            .start()
-            .context("open PipeWire capture stream")?;
+        if let Err(e) = self.audio.start() {
+            // Do not leave the state machine claiming to record when the
+            // PipeWire stream failed to open.
+            self.pipe_cmd(PipeCmd::Reset);
+            self.state.state = previous_state;
+            self.state.mode = previous_mode;
+            self.state.edit_buffer = previous_edit_buffer;
+            self.state.set_error(format!("audio start failed: {e:#}"));
+            return Err(e).context("open PipeWire capture stream");
+        }
         self.audio.resume_feed();
 
         self.last_speech_pending = false;
@@ -678,14 +764,15 @@ impl Daemon {
     }
 
     fn do_stop(&mut self) -> Result<()> {
-        let stop = self.state.stop();
-        match stop {
-            StopResult::AlreadyIdle => {
-                debug!("stop while idle/review — no-op");
-                return Ok(());
-            }
-            StopResult::Stopped | StopResult::EnteredEditReview => {}
+        if !self.state.is_capturing() {
+            debug!("stop while idle/review — no-op");
+            return Ok(());
         }
+
+        let mode = self.state.mode;
+        // Stop accepting lossy previews before flushing the VAD pipeline.
+        // Final chunks must reach the worker ahead of any stale previews.
+        self.stt.cancel_previews();
 
         // Flush pipeline (and take full Edit buffer when accumulating).
         let flushed = self.pipe_flush();
@@ -697,28 +784,43 @@ impl Daemon {
 
         self.last_speech_pending = false;
 
-        match stop {
-            StopResult::Stopped => {
+        match mode {
+            Mode::Live => {
                 // Live: force-close any open utterance so the last words are transcribed.
                 if let Some(tail) = flushed {
                     if !tail.is_empty() {
                         if let Err(e) = self.stt.push_chunk(tail) {
                             warn!(error = %e, "failed to enqueue final live chunk");
-                        } else {
-                            // Best-effort drain of in-flight results (do not block IPC long).
-                            for _ in 0..10 {
-                                thread::sleep(Duration::from_millis(30));
-                                self.drain_stt_results();
-                            }
                         }
                     }
+                }
+
+                // Keep the state in Recording/Paused while final results are
+                // drained so `on_transcript` still performs injection. The
+                // barrier also covers final chunks that closed just before
+                // Stop and were already queued on the worker.
+                if let Err(e) = self.stt.wait_idle(Duration::from_secs(30)) {
+                    self.state
+                        .set_error(format!("stt stop flush failed: {e:#}"));
+                    warn!(error = %e, "timed out waiting for final live transcript");
+                }
+                self.drain_stt_results();
+
+                let stop = self.state.stop();
+                if stop != StopResult::Stopped {
+                    warn!(?stop, "live stop produced unexpected state transition");
                 }
                 let _ = self.stt.reset_session();
                 self.overlay.destroy_surface();
                 info!("stopped → idle");
                 Ok(())
             }
-            StopResult::EnteredEditReview => {
+            Mode::Edit => {
+                let stop = self.state.stop();
+                if stop != StopResult::EnteredEditReview {
+                    warn!(?stop, "edit stop produced unexpected state transition");
+                    return Ok(());
+                }
                 let samples = flushed.unwrap_or_default();
                 info!(n_samples = samples.len(), "edit stop — full-buffer STT");
 
@@ -741,7 +843,6 @@ impl Daemon {
                 info!("entered EditReview");
                 Ok(())
             }
-            StopResult::AlreadyIdle => Ok(()),
         }
     }
 
@@ -750,26 +851,7 @@ impl Daemon {
         match self.state.state {
             DaemonState::Recording => self.do_stop(),
             DaemonState::Idle | DaemonState::Paused | DaemonState::EditReview => {
-                // state.toggle would call start; mirror with do_start.
-                match self.state.state {
-                    DaemonState::Paused => {
-                        // Toggle from paused: resume (proto: Idle/Paused → Start).
-                        let _ = self.state.toggle(mode);
-                        self.audio.resume_feed();
-                        self.overlay.set_paused(false);
-                        Ok(())
-                    }
-                    _ => {
-                        // EditReview: abandon review and start fresh.
-                        if self.state.state == DaemonState::EditReview {
-                            self.overlay.destroy_surface();
-                            self.state.edit_buffer.clear();
-                        }
-                        // Force Idle so do_start's state.start sees Idle.
-                        self.state.state = DaemonState::Idle;
-                        self.do_start(mode)
-                    }
-                }
+                self.do_start(mode)
             }
         }
     }
@@ -781,6 +863,8 @@ impl Daemon {
             }
             SetModeResult::SessionModeChanged { from, to } => {
                 info!(?from, ?to, "retargeting pipeline mode mid-session");
+                let _ = self.stt.reset_session();
+                self.pipe_cmd(PipeCmd::Reset);
                 self.pipe_cmd(PipeCmd::SetMode(to));
             }
         }
@@ -850,11 +934,7 @@ impl Daemon {
 
     fn pipe_flush(&self) -> Option<Vec<f32>> {
         let (tx, rx) = mpsc::channel();
-        if self
-            .pipe_cmd_tx
-            .send(PipeCmd::Flush { reply: tx })
-            .is_err()
-        {
+        if self.pipe_cmd_tx.send(PipeCmd::Flush { reply: tx }).is_err() {
             warn!("pipeline flush: command channel closed");
             return None;
         }
@@ -886,6 +966,7 @@ fn pipeline_main(
     sample_rx: Receiver<Vec<f32>>,
     silence_gap_ms: u32,
     stt_cmd: SyncSender<SttCommand>,
+    stt_preview: SyncSender<Vec<f32>>,
     cmd_rx: Receiver<PipeCmd>,
     ev_tx: Sender<PipeEvent>,
     max_edit_samples: usize,
@@ -999,9 +1080,8 @@ fn pipeline_main(
                                     warn!("STT command queue full — dropping live chunk");
                                 }
                                 std::sync::mpsc::TrySendError::Disconnected(_) => {
-                                    let _ = ev_tx.send(PipeEvent::Error(
-                                        "STT worker disconnected".into(),
-                                    ));
+                                    let _ = ev_tx
+                                        .send(PipeEvent::Error("STT worker disconnected".into()));
                                     return;
                                 }
                             }
@@ -1016,24 +1096,18 @@ fn pipeline_main(
                 }
 
                 // Live in-progress preview (throttled).
-                if mode == Mode::Live
-                    && pending
-                    && last_preview.elapsed() >= preview_interval
-                {
+                if mode == Mode::Live && pending && last_preview.elapsed() >= preview_interval {
                     let cur = chunker.peek_current();
                     // Need a bit of audio before whisper is useful (~0.5 s).
                     if cur.len() >= SAMPLE_RATE_HZ as usize / 2 {
                         let preview = cur.to_vec();
-                        if stt_cmd.try_send(SttCommand::LivePreview(preview)).is_ok() {
+                        if stt_preview.try_send(preview).is_ok() {
                             last_preview = Instant::now();
                         }
                     }
                 }
 
-                if mode == Mode::Edit
-                    && !cap_notified
-                    && edit_samples >= max_edit_samples
-                {
+                if mode == Mode::Edit && !cap_notified && edit_samples >= max_edit_samples {
                     cap_notified = true;
                     let _ = ev_tx.send(PipeEvent::EditCapReached);
                 }

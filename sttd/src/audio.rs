@@ -403,10 +403,16 @@ fn pipewire_thread(
         *pw::keys::NODE_NAME => "sttd-capture",
         *pw::keys::NODE_DESCRIPTION => "sttd speech capture",
     };
-    if let Some(ref target) = node_name {
+    let target = node_name.as_deref().unwrap_or("default");
+    if node_name.is_some() {
         // "target.object" is PW_KEY_TARGET_OBJECT (pipewire ≥0.3.44).
         // Use the string key so we don't require a versioned crate feature.
-        props.insert("target.object", target.as_str());
+        props.insert("target.object", target);
+    } else {
+        // Native PipeWire streams otherwise tend to attach to a virtual
+        // EasyEffects source. The session manager understands "default" and
+        // resolves it through its default.audio.source metadata.
+        props.insert("target.object", target);
     }
 
     let stream = match pw::stream::StreamRc::new(core, "sttd-capture", props) {
@@ -608,7 +614,7 @@ fn pipewire_thread(
     info!(
         sample_rate,
         channels,
-        node = ?node_name,
+        node = target,
         "audio: pipewire mainloop running"
     );
     mainloop.run();

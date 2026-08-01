@@ -6,7 +6,9 @@
 sample_rate = 16000
 channels = 1
 # Silence gap that closes a speech chunk (milliseconds).
-silence_gap_ms = 500
+vad_silence_ms = 500
+# Maximum Edit-mode capture duration (seconds).
+max_edit_seconds = 300
 # Bounded mpsc capacity for VAD → STT backpressure (number of chunks).
 stt_channel_capacity = 8
 # Optional PipeWire source node name (omit for default).
@@ -14,9 +16,7 @@ stt_channel_capacity = 8
 
 [model]
 # File under directory (or absolute path).
-name = "ggml-base.en.bin"
-# Default: ~/.local/share/sttd/models/
-# directory = "/home/you/.local/share/sttd/models"
+path = "~/.local/share/sttd/models/ggml-base.en.bin"
 # preload = load at daemon start; lazy = load on first Start.
 residency = "preload"
 # 0 = library default / auto.
@@ -26,9 +26,12 @@ language = "en"
 [overlay]
 enabled = true
 # In-progress preview crossfade (ms); Live mode overlay-only.
-preview_crossfade_ms = 200
-# Edit buffer cap in seconds (~5 minutes).
-edit_buffer_cap_secs = 300
+crossfade_ms = 200
+# top, bottom, left, right, top_left, top_right, bottom_left,
+# bottom_right, or center.
+anchor = "bottom"
+# Margin from the selected screen edge(s), in pixels.
+margin = 16
 
 [injection]
 # Requires compositor support for virtual-keyboard-unstable-v1.

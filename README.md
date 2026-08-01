@@ -155,7 +155,8 @@ RUST_LOG=info ./target/release/sttd
 sttctl toggle
 ```
 
-Control client (`sttctl` uses a **500 ms** socket timeout):
+Control client (`sttctl` uses a **500 ms** status timeout and up to **120 s** for
+commands that may load Whisper or flush a final transcript):
 
 ```bash
 sttctl start --mode live   # or: sttctl start --mode edit

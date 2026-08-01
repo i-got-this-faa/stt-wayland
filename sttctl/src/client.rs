@@ -1,7 +1,9 @@
 //! Unix-socket client for talking to `sttd`.
 //!
 //! Wire: newline-delimited JSON ([`proto::Request`] / [`proto::Response`]).
-//! Connect + read/write timeout defaults to [`proto::CLIENT_TIMEOUT_MS`] (500 ms).
+//! Status requests use a short timeout; mutating commands use the longer
+//! [`proto::OPERATION_TIMEOUT_MS`] budget because Stop may wait for Whisper to
+//! finish the final utterance.
 //!
 //! Socket path resolution (highest priority first):
 //! 1. Explicit path passed to [`Client::from_override`]
@@ -14,7 +16,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use proto::{decode_line, default_socket_path, encode_line, Request, Response, CLIENT_TIMEOUT_MS};
+use proto::{
+    decode_line, default_socket_path, encode_line, Request, Response, CLIENT_TIMEOUT_MS,
+    OPERATION_TIMEOUT_MS,
+};
 
 /// Message printed (and used as the error) when the daemon times out.
 pub const DAEMON_NOT_RESPONDING: &str = "daemon not responding";
@@ -23,7 +28,6 @@ pub const DAEMON_NOT_RESPONDING: &str = "daemon not responding";
 #[derive(Debug, Clone)]
 pub struct Client {
     socket_path: PathBuf,
-    timeout: Duration,
 }
 
 impl Client {
@@ -31,14 +35,14 @@ impl Client {
     pub fn from_override(socket: Option<PathBuf>) -> Self {
         Self {
             socket_path: resolve_socket_path(socket),
-            timeout: Duration::from_millis(CLIENT_TIMEOUT_MS),
         }
     }
 
     /// Send one JSON request line, read one response line.
     ///
     /// On connect/read/write timeout, returns an error whose message is
-    /// [`DAEMON_NOT_RESPONDING`].
+    /// [`DAEMON_NOT_RESPONDING`]. Status uses the short timeout; operations
+    /// use the model/inference timeout.
     pub fn call(&self, request: &Request) -> Result<Response> {
         let mut stream = match UnixStream::connect(&self.socket_path) {
             Ok(s) => s,
@@ -55,10 +59,11 @@ impl Client {
             }
         };
 
-        if let Err(err) = stream.set_read_timeout(Some(self.timeout)) {
+        let timeout = request_timeout(request);
+        if let Err(err) = stream.set_read_timeout(Some(timeout)) {
             return Err(map_io_error(err, "set_read_timeout"));
         }
-        if let Err(err) = stream.set_write_timeout(Some(self.timeout)) {
+        if let Err(err) = stream.set_write_timeout(Some(timeout)) {
             return Err(map_io_error(err, "set_write_timeout"));
         }
 
@@ -81,6 +86,18 @@ impl Client {
         }
 
         decode_line::<Response>(&line).context("decode response")
+    }
+}
+
+fn request_timeout(request: &Request) -> Duration {
+    match request {
+        Request::Status => Duration::from_millis(CLIENT_TIMEOUT_MS),
+        Request::Start { .. }
+        | Request::Stop
+        | Request::Toggle { .. }
+        | Request::SetMode { .. }
+        | Request::Pause
+        | Request::Resume => Duration::from_millis(OPERATION_TIMEOUT_MS),
     }
 }
 

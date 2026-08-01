@@ -6,7 +6,8 @@
 //! `$XDG_RUNTIME_DIR/sttd.sock` ([`SOCKET_NAME`]).
 //!
 //! Clients send a single [`Request`] line and read a single [`Response`] line.
-//! Recommended connect/read/write timeout: [`CLIENT_TIMEOUT_MS`] (500 ms).
+//! Status/connect timeout: [`CLIENT_TIMEOUT_MS`] (500 ms). Mutating commands
+//! may perform Whisper inference or model loading and use [`OPERATION_TIMEOUT_MS`].
 //!
 //! # Example
 //!
@@ -35,6 +36,10 @@ pub const SOCKET_NAME: &str = "sttd.sock";
 
 /// Recommended client connect / read / write timeout (milliseconds).
 pub const CLIENT_TIMEOUT_MS: u64 = 500;
+
+/// Upper bound for a mutating command that may wait for model loading or a
+/// final live transcription before replying (milliseconds).
+pub const OPERATION_TIMEOUT_MS: u64 = 120_000;
 
 // ---------------------------------------------------------------------------
 // Mode
@@ -540,6 +545,7 @@ mod tests {
     fn socket_name_and_timeout_constants() {
         assert_eq!(SOCKET_NAME, "sttd.sock");
         assert_eq!(CLIENT_TIMEOUT_MS, 500);
+        assert_eq!(OPERATION_TIMEOUT_MS, 120_000);
     }
 
     #[test]

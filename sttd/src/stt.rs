@@ -6,7 +6,8 @@
 //! (whisper contexts are not cheaply shared across threads). Callers talk to it
 //! through bounded `mpsc` channels:
 //!
-//! - **In**: [`SttCommand`] jobs (`LiveChunk`, `LivePreview`, `EditFull`, …)
+//! - **In**: bounded final/control [`SttCommand`] jobs plus a coalesced preview
+//!   channel
 //! - **Out**: [`TranscriptResult`] `{ text, is_final }` for live/preview path
 //!
 //! VAD-closed chunks are expected on a bounded channel (backpressure when the
@@ -26,7 +27,9 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvError, SendError, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{
+    self, Receiver, RecvError, SendError, SyncSender, TryRecvError, TrySendError,
+};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::fs;
@@ -61,17 +64,15 @@ pub struct TranscriptResult {
 pub enum SttCommand {
     /// Live mode: VAD-closed speech chunk → committed text (`is_final = true`).
     LiveChunk(Vec<f32>),
-    /// Live mode: in-progress audio for overlay preview only (`is_final = false`).
-    LivePreview(Vec<f32>),
     /// Edit mode: transcribe the entire buffer once; reply on `reply`.
     EditFull {
         samples: Vec<f32>,
         reply: mpsc::Sender<Result<TranscriptResult>>,
     },
     /// Load the model if not yet resident (lazy residency / explicit warm-up).
-    EnsureLoaded {
-        reply: mpsc::Sender<Result<()>>,
-    },
+    EnsureLoaded { reply: mpsc::Sender<Result<()>> },
+    /// Reply after every command queued before this barrier has completed.
+    Barrier { reply: mpsc::Sender<()> },
     /// Clear Live overlap tail + prompt state (e.g. between Stop → Start).
     ResetSession,
     /// Stop the worker loop and drop the model.
@@ -85,11 +86,13 @@ pub enum SttCommand {
 /// [`Self::try_recv_result`]. Edit mode uses [`Self::transcribe_full`].
 pub struct SttEngine {
     cmd_tx: SyncSender<SttCommand>,
+    preview_tx: SyncSender<Vec<f32>>,
     result_rx: Receiver<TranscriptResult>,
     join: Option<JoinHandle<()>>,
     model_path: PathBuf,
     residency: ModelResidency,
     loaded: Arc<AtomicBool>,
+    preview_cancel: Arc<AtomicBool>,
 }
 
 impl SttEngine {
@@ -117,6 +120,7 @@ impl SttEngine {
         };
         let residency = cfg.residency;
         let loaded = Arc::new(AtomicBool::new(false));
+        let preview_cancel = Arc::new(AtomicBool::new(false));
 
         info!(
             path = %model_path.display(),
@@ -129,7 +133,14 @@ impl SttEngine {
         );
 
         let (cmd_tx, cmd_rx) = mpsc::sync_channel::<SttCommand>(capacity);
-        let (result_tx, result_rx) = mpsc::sync_channel::<TranscriptResult>(capacity);
+        // Preview work is lossy and must never occupy slots needed by final
+        // Live chunks or control barriers. A one-entry channel also coalesces
+        // previews naturally while Whisper is busy.
+        let (preview_tx, preview_rx) = mpsc::sync_channel::<Vec<f32>>(1);
+        // Results are small and the core loop drains them continuously. Keep
+        // this channel unbounded so a stop barrier cannot deadlock behind a
+        // full result queue while the core thread waits for final text.
+        let (result_tx, result_rx) = mpsc::channel::<TranscriptResult>();
 
         let worker_cfg = WorkerConfig {
             model_path: model_path.clone(),
@@ -139,20 +150,23 @@ impl SttEngine {
             overlap_samples,
             preload: residency == ModelResidency::Preload,
             loaded: Arc::clone(&loaded),
+            preview_cancel: Arc::clone(&preview_cancel),
         };
 
         let join = thread::Builder::new()
             .name("sttd-whisper".into())
-            .spawn(move || worker_main(worker_cfg, cmd_rx, result_tx))
+            .spawn(move || worker_main(worker_cfg, cmd_rx, preview_rx, result_tx))
             .context("spawn stt worker thread")?;
 
         let engine = Self {
             cmd_tx,
+            preview_tx,
             result_rx,
             join: Some(join),
             model_path,
             residency,
             loaded,
+            preview_cancel,
         };
 
         if residency == ModelResidency::Preload {
@@ -201,13 +215,13 @@ impl SttEngine {
 
     /// Live: in-progress audio for overlay preview (`is_final = false` results).
     pub fn push_preview(&self, samples: Vec<f32>) -> Result<()> {
-        self.cmd_tx
-            .send(SttCommand::LivePreview(samples))
+        self.preview_tx
+            .send(samples)
             .map_err(|_| anyhow!("stt worker thread is not running"))
     }
 
-    pub fn try_push_preview(&self, samples: Vec<f32>) -> Result<(), TrySendError<SttCommand>> {
-        self.cmd_tx.try_send(SttCommand::LivePreview(samples))
+    pub fn try_push_preview(&self, samples: Vec<f32>) -> Result<(), TrySendError<Vec<f32>>> {
+        self.preview_tx.try_send(samples)
     }
 
     /// Blocking receive of the next Live/preview transcript.
@@ -258,6 +272,30 @@ impl SttEngine {
             .map_err(|_| anyhow!("stt worker thread is not running"))
     }
 
+    /// Cancel queued/in-flight preview work at the next worker boundary.
+    ///
+    /// Preview jobs are deliberately lossy; final Live chunks must not wait
+    /// behind them when the user stops recording.
+    pub fn cancel_previews(&self) {
+        self.preview_cancel.store(true, Ordering::Release);
+    }
+
+    /// Allow preview jobs for a new/continued Live session.
+    pub fn resume_previews(&self) {
+        self.preview_cancel.store(false, Ordering::Release);
+    }
+
+    /// Wait until all commands queued before this call have completed.
+    pub fn wait_idle(&self, timeout: Duration) -> Result<()> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.cmd_tx
+            .send(SttCommand::Barrier { reply: reply_tx })
+            .map_err(|_| anyhow!("stt worker thread is not running"))?;
+        reply_rx
+            .recv_timeout(timeout)
+            .map_err(|_| anyhow!("timed out waiting for stt worker to become idle"))
+    }
+
     /// Signal shutdown and join the worker (also done in [`Drop`]).
     pub fn shutdown(mut self) -> Result<()> {
         self.shutdown_inner()
@@ -276,6 +314,11 @@ impl SttEngine {
     /// Clone of the command sender for VAD / audio threads.
     pub fn command_sender(&self) -> SyncSender<SttCommand> {
         self.cmd_tx.clone()
+    }
+
+    /// Clone the lossy preview sender for the VAD/pipeline thread.
+    pub fn preview_sender(&self) -> SyncSender<Vec<f32>> {
+        self.preview_tx.clone()
     }
 }
 
@@ -299,12 +342,14 @@ struct WorkerConfig {
     overlap_samples: usize,
     preload: bool,
     loaded: Arc<AtomicBool>,
+    preview_cancel: Arc<AtomicBool>,
 }
 
 fn worker_main(
     cfg: WorkerConfig,
     cmd_rx: Receiver<SttCommand>,
-    result_tx: SyncSender<TranscriptResult>,
+    preview_rx: Receiver<Vec<f32>>,
+    result_tx: mpsc::Sender<TranscriptResult>,
 ) {
     info!(
         path = %cfg.model_path.display(),
@@ -321,49 +366,54 @@ fn worker_main(
         }
     }
 
-    while let Ok(cmd) = cmd_rx.recv() {
-        match cmd {
-            SttCommand::Shutdown => {
-                debug!("stt worker: shutdown");
-                break;
+    loop {
+        // Final chunks and control commands always win over previews.
+        match cmd_rx.try_recv() {
+            Ok(SttCommand::Barrier { reply }) => {
+                if worker.cfg.preview_cancel.load(Ordering::Acquire) {
+                    while preview_rx.try_recv().is_ok() {}
+                }
+                let _ = reply.send(());
+                continue;
             }
-            SttCommand::ResetSession => {
-                worker.reset_session();
+            Ok(cmd) => {
+                if !process_command(&mut worker, cmd, &result_tx) {
+                    break;
+                }
+                continue;
             }
-            SttCommand::EnsureLoaded { reply } => {
-                let res = worker.ensure_loaded();
-                let _ = reply.send(res);
-            }
-            SttCommand::LiveChunk(samples) => {
-                match worker.transcribe_live(samples, true) {
-                    Ok(result) => {
-                        if send_result(&result_tx, result).is_err() {
-                            warn!("stt worker: result consumer gone; exiting");
-                            break;
-                        }
+            Err(TryRecvError::Disconnected) => break,
+            Err(TryRecvError::Empty) => {}
+        }
+
+        if !worker.cfg.preview_cancel.load(Ordering::Acquire) {
+            match preview_rx.try_recv() {
+                Ok(samples) => {
+                    if !process_preview(&mut worker, samples, &result_tx) {
+                        break;
                     }
-                    Err(err) => {
-                        error!(error = %err, "stt worker: live chunk failed");
-                    }
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) | Err(TryRecvError::Empty) => {}
+            }
+        } else {
+            while preview_rx.try_recv().is_ok() {}
+        }
+
+        match cmd_rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(SttCommand::Barrier { reply }) => {
+                if worker.cfg.preview_cancel.load(Ordering::Acquire) {
+                    while preview_rx.try_recv().is_ok() {}
+                }
+                let _ = reply.send(());
+            }
+            Ok(cmd) => {
+                if !process_command(&mut worker, cmd, &result_tx) {
+                    break;
                 }
             }
-            SttCommand::LivePreview(samples) => {
-                match worker.transcribe_live(samples, false) {
-                    Ok(result) => {
-                        if send_result(&result_tx, result).is_err() {
-                            warn!("stt worker: result consumer gone; exiting");
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        error!(error = %err, "stt worker: live preview failed");
-                    }
-                }
-            }
-            SttCommand::EditFull { samples, reply } => {
-                let res = worker.transcribe_edit(samples);
-                let _ = reply.send(res);
-            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
 
@@ -371,8 +421,79 @@ fn worker_main(
     info!("stt worker: exited");
 }
 
+/// Process a final/control command. Returns false when the worker should exit.
+fn process_command(
+    worker: &mut SttWorker,
+    cmd: SttCommand,
+    result_tx: &mpsc::Sender<TranscriptResult>,
+) -> bool {
+    match cmd {
+        SttCommand::Shutdown => {
+            debug!("stt worker: shutdown");
+            false
+        }
+        SttCommand::ResetSession => {
+            worker.reset_session();
+            true
+        }
+        SttCommand::EnsureLoaded { reply } => {
+            let res = worker.ensure_loaded();
+            let _ = reply.send(res);
+            true
+        }
+        SttCommand::Barrier { reply } => {
+            let _ = reply.send(());
+            true
+        }
+        SttCommand::LiveChunk(samples) => {
+            match worker.transcribe_live(samples, true) {
+                Ok(result) => {
+                    if send_result(result_tx, result).is_err() {
+                        warn!("stt worker: result consumer gone; exiting");
+                        return false;
+                    }
+                }
+                Err(err) => {
+                    error!(error = %err, "stt worker: live chunk failed");
+                }
+            }
+            true
+        }
+        SttCommand::EditFull { samples, reply } => {
+            let res = worker.transcribe_edit(samples);
+            let _ = reply.send(res);
+            true
+        }
+    }
+}
+
+fn process_preview(
+    worker: &mut SttWorker,
+    samples: Vec<f32>,
+    result_tx: &mpsc::Sender<TranscriptResult>,
+) -> bool {
+    if worker.cfg.preview_cancel.load(Ordering::Acquire) {
+        return true;
+    }
+
+    match worker.transcribe_live(samples, false) {
+        Ok(result) => {
+            if send_result(result_tx, result).is_err() {
+                warn!("stt worker: result consumer gone; exiting");
+                false
+            } else {
+                true
+            }
+        }
+        Err(err) => {
+            error!(error = %err, "stt worker: live preview failed");
+            true
+        }
+    }
+}
+
 fn send_result(
-    tx: &SyncSender<TranscriptResult>,
+    tx: &mpsc::Sender<TranscriptResult>,
     result: TranscriptResult,
 ) -> Result<(), SendError<TranscriptResult>> {
     tx.send(result)
@@ -464,12 +585,7 @@ impl SttWorker {
                 path,
                 whisper_rs::WhisperContextParameters::default(),
             )
-            .map_err(|e| {
-                anyhow!(
-                    "failed to load whisper model at {}: {e}",
-                    path.display()
-                )
-            })?;
+            .map_err(|e| anyhow!("failed to load whisper model at {}: {e}", path.display()))?;
 
             let state = ctx
                 .create_state()
@@ -510,15 +626,18 @@ impl SttWorker {
         let use_prompt = is_final && !self.last_prompt.is_empty();
         let text = self.run_whisper(&pcm, use_prompt)?;
 
-        // Keep only the tail of *this* chunk so overlap size stays bounded.
-        let n = self.cfg.overlap_samples.min(samples.len());
-        if n > 0 {
-            self.overlap_tail = samples[samples.len() - n..].to_vec();
-        } else {
-            self.overlap_tail.clear();
-        }
-
         if is_final {
+            // Keep only the tail of the committed chunk. Preview jobs are
+            // snapshots of the current utterance; updating the overlap from
+            // them would duplicate the preview tail in the eventual final
+            // chunk and make repeated previews affect decoder continuity.
+            let n = self.cfg.overlap_samples.min(samples.len());
+            if n > 0 {
+                self.overlap_tail = samples[samples.len() - n..].to_vec();
+            } else {
+                self.overlap_tail.clear();
+            }
+
             if !text.is_empty() {
                 // Prefer last ~200 chars as prompt context for the next chunk.
                 self.last_prompt = truncate_prompt(&text, 200);
@@ -569,9 +688,8 @@ impl SttWorker {
             .as_mut()
             .ok_or_else(|| anyhow!("whisper state missing after load"))?;
 
-        let mut params = whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy {
-            best_of: 1,
-        });
+        let mut params =
+            whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy { best_of: 1 });
 
         params.set_n_threads(self.cfg.threads);
         // English-only models (base.en / small.en); language from config, default "en".
@@ -604,10 +722,7 @@ impl SttWorker {
 
         let mut out = String::new();
         for segment in state.as_iter() {
-            let piece = segment
-                .to_str()
-                .map(|s| s.trim())
-                .unwrap_or("");
+            let piece = segment.to_str().map(|s| s.trim()).unwrap_or("");
             if piece.is_empty() {
                 continue;
             }

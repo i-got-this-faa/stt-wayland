@@ -66,17 +66,25 @@ impl AppState {
     /// From Paused: resumes (returns [`StartResult::Resumed`]).
     /// From Idle / EditReview: begins a new session (clears edit buffer on Edit).
     pub fn start(&mut self, mode: Mode) -> StartResult {
-        self.mode = mode;
         match self.state {
-            DaemonState::Recording => StartResult::AlreadyRecording,
+            DaemonState::Recording => {
+                // Starting an already active session is deliberately a no-op.
+                // Use SetMode when the caller explicitly wants to retarget a
+                // live session; changing `mode` here would make status claim a
+                // different pipeline than the one actually running.
+                StartResult::AlreadyRecording
+            }
             DaemonState::Paused => {
+                self.mode = mode;
                 self.state = DaemonState::Recording;
                 debug!(?mode, "state: start → resumed from paused");
                 StartResult::Resumed
             }
             DaemonState::Idle | DaemonState::EditReview => {
+                let was_edit_review = self.state == DaemonState::EditReview;
+                self.mode = mode;
                 self.state = DaemonState::Recording;
-                if mode == Mode::Edit {
+                if mode == Mode::Edit || was_edit_review {
                     self.edit_buffer.clear();
                 }
                 debug!(?mode, "state: start → recording");
@@ -153,7 +161,10 @@ impl AppState {
 
         match self.state {
             DaemonState::Recording | DaemonState::Paused if prev != mode => {
-                SetModeResult::SessionModeChanged { from: prev, to: mode }
+                SetModeResult::SessionModeChanged {
+                    from: prev,
+                    to: mode,
+                }
             }
             _ => SetModeResult::Stored { mode },
         }
@@ -232,8 +243,8 @@ mod tests {
         assert_eq!(s.start(Mode::Live), StartResult::Started);
         assert_eq!(s.start(Mode::Edit), StartResult::AlreadyRecording);
         assert_eq!(s.state, DaemonState::Recording);
-        // Mode is still updated by start() for the requested mode field.
-        assert_eq!(s.mode, Mode::Edit);
+        // Start while recording is a true no-op; use `mode edit` to retarget.
+        assert_eq!(s.mode, Mode::Live);
     }
 
     #[test]
@@ -271,6 +282,18 @@ mod tests {
         s.set_edit_buffer("hello".into());
         s.finish_edit_review();
         assert_eq!(s.state, DaemonState::Idle);
+        assert!(s.edit_buffer.is_empty());
+    }
+
+    #[test]
+    fn starting_from_edit_review_abandons_stale_buffer() {
+        let mut s = st();
+        s.start(Mode::Edit);
+        s.stop();
+        s.set_edit_buffer("stale review".into());
+
+        assert_eq!(s.start(Mode::Live), StartResult::Started);
+        assert_eq!(s.state, DaemonState::Recording);
         assert!(s.edit_buffer.is_empty());
     }
 }

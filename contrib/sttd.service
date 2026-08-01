@@ -18,7 +18,9 @@ Environment=RUST_LOG=info
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%t %h/.local/share/sttd %h/.config/sttd
+# The config file is optional and read-only; listing a missing config
+# directory here makes systemd fail namespace setup before ExecStart.
+ReadWritePaths=%t %h/.local/share/sttd
 PrivateTmp=true
 
 [Install]

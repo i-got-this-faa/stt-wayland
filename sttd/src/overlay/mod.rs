@@ -28,7 +28,7 @@ use anyhow::Context;
 #[cfg(feature = "overlay")]
 use tracing::{info, warn};
 
-use crate::config::OverlayConfig;
+use crate::config::{OverlayAnchor, OverlayConfig};
 
 // ── Control plane (UI → daemon) ─────────────────────────────────────────────
 
@@ -77,7 +77,11 @@ impl ChannelControlSink {
 
 impl ControlSink for ChannelControlSink {
     fn pause(&self) {
-        let _ = self.tx.lock().ok().and_then(|tx| tx.send(ControlEvent::Pause).ok());
+        let _ = self
+            .tx
+            .lock()
+            .ok()
+            .and_then(|tx| tx.send(ControlEvent::Pause).ok());
     }
     fn resume(&self) {
         let _ = self
@@ -87,7 +91,11 @@ impl ControlSink for ChannelControlSink {
             .and_then(|tx| tx.send(ControlEvent::Resume).ok());
     }
     fn stop(&self) {
-        let _ = self.tx.lock().ok().and_then(|tx| tx.send(ControlEvent::Stop).ok());
+        let _ = self
+            .tx
+            .lock()
+            .ok()
+            .and_then(|tx| tx.send(ControlEvent::Stop).ok());
     }
     fn commit_edit(&self, text: String) {
         let _ = self
@@ -136,11 +144,85 @@ impl Default for OverlayLayout {
     }
 }
 
+/// Translate the user-facing overlay anchor/margin settings into layer-shell
+/// edge anchors. An unanchored edge lets layer-shell center the natural-size
+/// card on that axis; this keeps the `center` mode small instead of creating a
+/// full-screen input surface.
+fn layout_from_config(cfg: &OverlayConfig) -> OverlayLayout {
+    let margin = cfg.margin.max(0);
+    let mut layout = OverlayLayout {
+        anchor_left: false,
+        anchor_right: false,
+        anchor_top: false,
+        anchor_bottom: false,
+        margin_left: 0,
+        margin_right: 0,
+        margin_top: 0,
+        margin_bottom: 0,
+    };
+
+    match cfg.anchor {
+        OverlayAnchor::Top => {
+            layout.anchor_left = true;
+            layout.anchor_right = true;
+            layout.anchor_top = true;
+            layout.margin_top = margin;
+        }
+        OverlayAnchor::Bottom => {
+            layout.anchor_left = true;
+            layout.anchor_right = true;
+            layout.anchor_bottom = true;
+            layout.margin_bottom = margin;
+        }
+        OverlayAnchor::Left => {
+            layout.anchor_left = true;
+            layout.anchor_top = true;
+            layout.anchor_bottom = true;
+            layout.margin_left = margin;
+        }
+        OverlayAnchor::Right => {
+            layout.anchor_right = true;
+            layout.anchor_top = true;
+            layout.anchor_bottom = true;
+            layout.margin_right = margin;
+        }
+        OverlayAnchor::TopLeft => {
+            layout.anchor_left = true;
+            layout.anchor_top = true;
+            layout.margin_left = margin;
+            layout.margin_top = margin;
+        }
+        OverlayAnchor::TopRight => {
+            layout.anchor_right = true;
+            layout.anchor_top = true;
+            layout.margin_right = margin;
+            layout.margin_top = margin;
+        }
+        OverlayAnchor::BottomLeft => {
+            layout.anchor_left = true;
+            layout.anchor_bottom = true;
+            layout.margin_left = margin;
+            layout.margin_bottom = margin;
+        }
+        OverlayAnchor::BottomRight => {
+            layout.anchor_right = true;
+            layout.anchor_bottom = true;
+            layout.margin_right = margin;
+            layout.margin_bottom = margin;
+        }
+        OverlayAnchor::Center => {}
+    }
+
+    layout
+}
+
 // ── Commands (daemon → UI thread) ───────────────────────────────────────────
 
 enum UiCmd {
     ShowLive,
-    ShowEditReview { text: String },
+    ShowEditReview {
+        text: String,
+    },
     /// Destroy any mapped surface (stop / leave review / hide).
     DestroySurface,
     SetPreview(String),
@@ -173,7 +255,7 @@ pub struct OverlayHandle {
 
 impl OverlayHandle {
     pub fn new(cfg: &OverlayConfig) -> Result<Self> {
-        Self::with_layout(cfg, OverlayLayout::default())
+        Self::with_layout(cfg, layout_from_config(cfg))
     }
 
     pub fn with_layout(cfg: &OverlayConfig, layout: OverlayLayout) -> Result<Self> {
@@ -444,9 +526,8 @@ fn gtk_thread_main(
 #[cfg(feature = "overlay")]
 fn install_css(crossfade_ms: u32) {
     let base = include_str!("style.css");
-    let dynamic = format!(
-        "\nlabel.sttd-preview {{ transition: opacity {crossfade_ms}ms ease-in-out; }}\n"
-    );
+    let dynamic =
+        format!("\nlabel.sttd-preview {{ transition: opacity {crossfade_ms}ms ease-in-out; }}\n");
     let css = format!("{base}{dynamic}");
 
     let provider = gtk4::CssProvider::new();
@@ -471,11 +552,7 @@ fn handle_cmd(state: &std::rc::Rc<std::cell::RefCell<UiState>>, cmd: UiCmd) {
             // If a surface was built with NoopSink, rebuild so buttons bind the real sink.
             let had_surface = state.borrow().surface.is_some();
             let mode = state.borrow().surface.as_ref().map(|s| s.mode);
-            let edit_text = state
-                .borrow()
-                .surface
-                .as_ref()
-                .map(|s| s.edit.text());
+            let edit_text = state.borrow().surface.as_ref().map(|s| s.edit.text());
             state.borrow_mut().control = Some(sink);
             if had_surface {
                 destroy_surface(state);
@@ -578,7 +655,6 @@ fn create_surface(state: &std::rc::Rc<std::cell::RefCell<UiState>>) {
     let window = gtk4::Window::new();
     window.add_css_class("sttd-overlay");
     window.set_decorated(false);
-    window.set_resizable(false);
     window.set_title(Some("sttd"));
     // Keep process alive after last window closes — runtime stays warm.
     window.set_hide_on_close(true);
@@ -591,6 +667,13 @@ fn create_surface(state: &std::rc::Rc<std::cell::RefCell<UiState>>) {
     apply_layout(&window, &layout);
 
     let stack = gtk4::Stack::new();
+    // Layer-shell anchors determine the surface allocation. Keep the stack
+    // explicitly fill-aligned so the card's own Center alignment is applied
+    // across a full-width top/bottom surface.
+    stack.set_hexpand(true);
+    stack.set_vexpand(true);
+    stack.set_halign(gtk4::Align::Fill);
+    stack.set_valign(gtk4::Align::Fill);
     stack.set_transition_type(gtk4::StackTransitionType::Crossfade);
     stack.set_transition_duration(120);
 
@@ -662,5 +745,43 @@ fn destroy_surface(state: &std::rc::Rc<std::cell::RefCell<UiState>>) {
         surf.window.set_child(None::<&gtk4::Widget>);
         surf.window.destroy();
         debug!("overlay: surface destroyed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_anchor_maps_to_expected_edges() {
+        let cfg = OverlayConfig {
+            anchor: OverlayAnchor::TopRight,
+            margin: 24,
+            ..OverlayConfig::default()
+        };
+
+        let layout = layout_from_config(&cfg);
+        assert!(!layout.anchor_left);
+        assert!(layout.anchor_right);
+        assert!(layout.anchor_top);
+        assert!(!layout.anchor_bottom);
+        assert_eq!(layout.margin_right, 24);
+        assert_eq!(layout.margin_top, 24);
+        assert_eq!(layout.margin_left, 0);
+        assert_eq!(layout.margin_bottom, 0);
+    }
+
+    #[test]
+    fn center_anchor_keeps_natural_size() {
+        let cfg = OverlayConfig {
+            anchor: OverlayAnchor::Center,
+            ..OverlayConfig::default()
+        };
+
+        let layout = layout_from_config(&cfg);
+        assert!(!layout.anchor_left);
+        assert!(!layout.anchor_right);
+        assert!(!layout.anchor_top);
+        assert!(!layout.anchor_bottom);
     }
 }

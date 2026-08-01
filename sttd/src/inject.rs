@@ -388,7 +388,8 @@ mod wl {
     /// Build unique keymap entries and the sequence of 1-based keycodes for `text`.
     fn build_keymap(text: &str) -> (Vec<KeymapEntry>, Vec<u32>) {
         let mut entries: Vec<KeymapEntry> = Vec::new();
-        // char → 1-based keycode
+        // char → Linux/evdev keycode. The compositor applies the standard
+        // +8 conversion when looking up the corresponding XKB keycode.
         let mut index: Vec<(char, u32)> = Vec::new();
         let mut seq: Vec<u32> = Vec::with_capacity(text.chars().count());
 
@@ -398,7 +399,7 @@ mod wl {
             } else {
                 let keysym = char_to_keysym_name(ch);
                 entries.push(KeymapEntry { keysym });
-                let kc = entries.len() as u32; // 1-based
+                let kc = entries.len() as u32;
                 index.push((ch, kc));
                 kc
             };
@@ -462,7 +463,9 @@ mod wl {
 
     /// Render a complete XKB keymap text blob (NUL-terminated for wtype parity).
     fn render_xkb_keymap(entries: &[KeymapEntry]) -> String {
-        // XKB keycodes used: 9 .. 8+len  → linux/evdev keycodes 1 .. len
+        // XKB keycodes used: 9 .. 8+len  ↔ linux/evdev keycodes 1 .. len.
+        // Keep one spare code above the last virtual key; this is the shape
+        // accepted by wlroots/Niri and matches wtype's generated keymap.
         let max_keycode = entries.len() + 8 + 1;
         let mut out = String::with_capacity(256 + entries.len() * 48);
         out.push_str("xkb_keymap {\n");
@@ -488,6 +491,12 @@ mod wl {
         // Trailing NUL is part of the blob size (matches wtype).
         out.push('\0');
         out
+    }
+
+    #[cfg(test)]
+    pub(super) fn keymap_test_data(text: &str) -> (Vec<u32>, String) {
+        let (entries, sequence) = build_keymap(text);
+        (sequence, render_xkb_keymap(&entries))
     }
 
     /// Create a memfd (or unlinked temp file), write `bytes`, rewind, return (fd, size).
@@ -567,5 +576,23 @@ mod tests {
         let cfg = InjectionConfig::default();
         let mut inj = Injector::new(&cfg).unwrap();
         inj.inject_text("").unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires a focused Wayland text field; run manually for compositor validation"]
+    fn inject_known_text_into_focused_client() {
+        let cfg = InjectionConfig::default();
+        let mut inj = Injector::new(&cfg).unwrap();
+        inj.inject_text("hello world").unwrap();
+    }
+
+    #[test]
+    fn emitted_keycodes_match_xkb_evdev_offset() {
+        let (sequence, keymap) = wl::keymap_test_data("aba");
+        assert_eq!(sequence, vec![1, 2, 1]);
+
+        assert!(keymap.contains("maximum = 11;"));
+        assert!(keymap.contains("<K1> = 9;"));
+        assert!(keymap.contains("<K2> = 10;"));
     }
 }

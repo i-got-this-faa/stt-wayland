@@ -12,6 +12,7 @@ Last verified: 2026-08-01 (workspace on Linux, Wayland session present).
 | `cargo check -p sttd --no-default-features` | **OK** (stub backends; no system GUI/audio required) |
 | `cargo test -p proto` | **OK** (25 tests + 1 doctest) |
 | `cargo test --workspace` | **OK** (proto + sttd unit tests: state, config, vad, stt helpers, inject probe) |
+| `stt-settings` GTK application | **OK** — profile/model/settings editor builds, launches on Wayland, and uses the shared TOML schema |
 | `sttctl` against missing socket | **OK** — exits non-zero with connect error (`No such file or directory` when sock absent; `daemon not responding` on I/O timeout) |
 | Daemon IPC smoke (custom `--socket`) | **OK** — bind listen, `status` / `start` / `stop` NDJSON round-trips |
 | Inject probe on this host | **OK** — `inject_available: true` (virtual-keyboard-unstable-v1 bound) |

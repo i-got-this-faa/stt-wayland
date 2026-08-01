@@ -11,6 +11,7 @@
 //! | `model`     | `path`, `residency` (`preload` \| `lazy`) |
 //! | `overlay`   | `anchor`, `margin`, `crossfade_ms` |
 //! | `injection` | `batch_mode` |
+//! | `tray`      | `enabled` |
 //!
 //! Legacy TOML keys (`silence_gap_ms`, `preview_crossfade_ms`, `name`+`directory`, …)
 //! are accepted via serde aliases / post-load normalization.
@@ -31,6 +32,7 @@ pub struct Config {
     pub model: ModelConfig,
     pub overlay: OverlayConfig,
     pub injection: InjectionConfig,
+    pub tray: TrayConfig,
 }
 
 impl Default for Config {
@@ -40,6 +42,7 @@ impl Default for Config {
             model: ModelConfig::default(),
             overlay: OverlayConfig::default(),
             injection: InjectionConfig::default(),
+            tray: TrayConfig::default(),
         };
         cfg.normalize();
         cfg
@@ -159,10 +162,7 @@ impl ModelConfig {
         if !self.path.is_empty() {
             return expand_tilde(&self.path);
         }
-        let dir = self
-            .directory
-            .clone()
-            .unwrap_or_else(default_models_dir);
+        let dir = self.directory.clone().unwrap_or_else(default_models_dir);
         let name = Path::new(&self.name);
         if name.is_absolute() {
             expand_tilde_path(name)
@@ -256,6 +256,22 @@ impl Default for InjectionConfig {
     }
 }
 
+// ─── Tray ───────────────────────────────────────────────────────────────────
+
+/// StatusNotifierItem tray configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TrayConfig {
+    /// Register a tray icon when a session D-Bus bus is available.
+    pub enabled: bool,
+}
+
+impl Default for TrayConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 // ─── Load / save ────────────────────────────────────────────────────────────
 
 impl Config {
@@ -276,10 +292,10 @@ impl Config {
             return Ok(Self::default());
         }
 
-        let text = fs::read_to_string(&path)
-            .with_context(|| format!("read config {}", path.display()))?;
-        let mut cfg: Config = toml::from_str(&text)
-            .with_context(|| format!("parse config {}", path.display()))?;
+        let text =
+            fs::read_to_string(&path).with_context(|| format!("read config {}", path.display()))?;
+        let mut cfg: Config =
+            toml::from_str(&text).with_context(|| format!("parse config {}", path.display()))?;
         cfg.normalize();
         Ok(cfg)
     }
@@ -288,7 +304,7 @@ impl Config {
     /// - expand `~` in model path
     /// - derive path from legacy `name`+`directory` when `path` empty
     /// - sync legacy field aliases used by other modules
-    fn normalize(&mut self) {
+    pub fn normalize(&mut self) {
         // Resolve path (handles empty path → name+directory, and `~` expansion).
         let expanded = self.model.model_path();
         self.model.path = expanded.to_string_lossy().into_owned();
@@ -334,13 +350,18 @@ impl Config {
 
 // ─── Paths ──────────────────────────────────────────────────────────────────
 
+/// The XDG configuration directory for `sttd`.
+pub fn default_config_dir() -> PathBuf {
+    if let Some(proj) = directories::ProjectDirs::from("", "", "sttd") {
+        proj.config_dir().to_path_buf()
+    } else {
+        PathBuf::from(".")
+    }
+}
+
 /// `~/.config/sttd/config.toml`
 pub fn default_config_path() -> PathBuf {
-    if let Some(proj) = directories::ProjectDirs::from("", "", "sttd") {
-        proj.config_dir().join("config.toml")
-    } else {
-        PathBuf::from("config.toml")
-    }
+    default_config_dir().join("config.toml")
 }
 
 /// `~/.local/share/sttd/models/`
@@ -396,6 +417,7 @@ mod tests {
         assert_eq!(cfg.overlay.preview_crossfade_ms, 200);
         assert_eq!(cfg.overlay.edit_buffer_cap_secs, 300);
         assert!(cfg.injection.batch_mode);
+        assert!(cfg.tray.enabled);
     }
 
     #[test]
@@ -425,6 +447,9 @@ crossfade_ms = 150
 
 [injection]
 batch_mode = true
+
+[tray]
+enabled = false
 "#;
         let mut cfg: Config = toml::from_str(toml).unwrap();
         cfg.normalize();
@@ -442,6 +467,7 @@ batch_mode = true
         assert_eq!(cfg.overlay.crossfade_ms, 150);
         assert_eq!(cfg.overlay.preview_crossfade_ms, 150);
         assert!(cfg.injection.batch_mode);
+        assert!(!cfg.tray.enabled);
     }
 
     #[test]

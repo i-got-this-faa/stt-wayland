@@ -11,13 +11,15 @@ name = "sttd"
 path = "src/main.rs"
 
 [features]
-default = ["audio", "stt-engine", "overlay", "inject"]
+default = ["audio", "stt-engine", "overlay", "inject", "tray"]
 # Optional feature gates so proto/cli (and minimal daemon stubs) can check without
 # full system libraries. Default enables the full stack when libs are present.
 audio = ["dep:pipewire"]
 stt-engine = ["dep:whisper-rs", "dep:webrtc-vad"]
 overlay = ["dep:gtk4", "dep:gtk4-layer-shell", "dep:glib"]
 inject = ["dep:wayland-client", "dep:wayland-protocols", "dep:wayland-protocols-misc"]
+tray = ["dep:ksni", "dep:resvg"]
+settings = ["dep:gtk4"]
 
 [dependencies]
 proto = { workspace = true }
@@ -44,3 +46,5 @@ glib = { workspace = true, optional = true }
 wayland-client = { workspace = true, optional = true }
 wayland-protocols = { workspace = true, optional = true }
 wayland-protocols-misc = { workspace = true, optional = true }
+ksni = { workspace = true, optional = true }
+resvg = { workspace = true, optional = true }

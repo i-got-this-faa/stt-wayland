@@ -24,6 +24,7 @@ mod inject;
 mod overlay;
 mod state;
 mod stt;
+mod tray;
 mod vad;
 
 use std::os::unix::fs::FileTypeExt;
@@ -90,6 +91,8 @@ enum CoreEvent {
     Overlay(ControlEvent),
     /// Pipeline → core notifications.
     Pipe(PipeEvent),
+    /// StatusNotifierItem tray actions.
+    Tray(tray::TrayEvent),
     /// Graceful shutdown (signal).
     Shutdown,
 }
@@ -219,6 +222,25 @@ async fn async_main(cfg: Config, socket: PathBuf) -> Result<()> {
                 }
             })
             .context("spawn pipeline event forwarder")?;
+    }
+
+    // Tray callbacks → same core path as IPC and overlay controls.
+    {
+        let tx = core_tx.clone();
+        let tray_rx = daemon
+            .tray_ev_rx
+            .take()
+            .ok_or_else(|| anyhow!("tray event receiver missing"))?;
+        thread::Builder::new()
+            .name("sttd-tray-fwd".into())
+            .spawn(move || {
+                while let Ok(ev) = tray_rx.recv() {
+                    if tx.send(CoreEvent::Tray(ev)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .context("spawn tray event forwarder")?;
     }
 
     {
@@ -383,13 +405,17 @@ struct Daemon {
     stt: SttEngine,
     inject: Injector,
     overlay: OverlayHandle,
+    tray: tray::TrayHandle,
 
     pipe_cmd_tx: Sender<PipeCmd>,
     /// Taken once at startup to bridge into CoreEvent.
     pipe_ev_rx: Option<Receiver<PipeEvent>>,
+    /// Taken once at startup to bridge into CoreEvent.
+    tray_ev_rx: Option<Receiver<tray::TrayEvent>>,
     _pipe_join: JoinHandle<()>,
 
     last_speech_pending: bool,
+    last_tray_snap: Option<tray::TraySnapshot>,
     /// STT result generation accepted by the active recording session.
     stt_session_id: u64,
 }
@@ -476,25 +502,33 @@ impl Daemon {
             .context("spawn pipeline thread")?;
 
         let overlay = OverlayHandle::new(&cfg.overlay).context("init overlay")?;
+        let (tray, tray_ev_rx) = tray::TrayHandle::pair(&cfg.tray).context("init tray")?;
         let stt_session_id = stt.session_id();
 
-        Ok(Self {
+        let mut daemon = Self {
             cfg,
             state,
             audio,
             stt,
             inject,
             overlay,
+            tray,
             pipe_cmd_tx,
             pipe_ev_rx: Some(pipe_ev_rx),
+            tray_ev_rx: Some(tray_ev_rx),
             _pipe_join: pipe_join,
             last_speech_pending: false,
+            last_tray_snap: None,
             stt_session_id,
-        })
+        };
+        daemon.sync_tray();
+        Ok(daemon)
     }
 
     /// Idle: no PW stream, no mapped overlay. Blocks until Shutdown.
     fn run_core_loop(&mut self, core_rx: Receiver<CoreEvent>) -> Result<()> {
+        self.tray.start();
+        self.sync_tray();
         info!("core loop running (idle)");
         let poll = Duration::from_millis(10);
 
@@ -519,11 +553,53 @@ impl Daemon {
                 Ok(CoreEvent::Pipe(ev)) => {
                     self.handle_pipe_event(ev);
                 }
+                Ok(CoreEvent::Tray(ev)) => {
+                    if self.handle_tray(ev) {
+                        return Ok(());
+                    }
+                }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
                     self.shutdown_subsystems();
                     return Ok(());
                 }
+            }
+
+            self.sync_tray();
+        }
+    }
+
+    fn current_tray_snapshot(&self) -> tray::TraySnapshot {
+        tray::TraySnapshot {
+            state: self.state.state,
+            mode: self.state.mode,
+            error: self.state.last_error.clone(),
+            model: self.state.model_name.clone(),
+        }
+    }
+
+    fn sync_tray(&mut self) {
+        let snapshot = self.current_tray_snapshot();
+        if self.last_tray_snap.as_ref() == Some(&snapshot) {
+            return;
+        }
+        self.tray.sync(snapshot.clone());
+        self.last_tray_snap = Some(snapshot);
+    }
+
+    /// Handle tray actions on the core loop thread. Returns `true` when the
+    /// daemon should exit after performing the normal shutdown sequence.
+    fn handle_tray(&mut self, event: tray::TrayEvent) -> bool {
+        match event {
+            tray::TrayEvent::Toggle => {
+                if let Err(error) = self.do_toggle(self.state.mode) {
+                    warn!(error = %error, "tray toggle failed");
+                }
+                false
+            }
+            tray::TrayEvent::Quit => {
+                self.shutdown_subsystems();
+                true
             }
         }
     }
@@ -994,6 +1070,7 @@ impl Daemon {
         }
         self.pipe_cmd(PipeCmd::Shutdown);
         self.overlay.destroy_surface();
+        self.tray.shutdown();
         let _ = self.stt.reset_session();
         // SttEngine + OverlayHandle drop joins their threads.
     }

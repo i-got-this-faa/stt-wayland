@@ -52,6 +52,10 @@ wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client"] }
 wayland-protocols-misc = { version = "0.3", features = ["client"] }
 
+# Tray (StatusNotifierItem over D-Bus)
+ksni = { version = "0.3", features = ["blocking"] }
+resvg = "0.45"
+
 # Misc
 libc = "0.2"
 

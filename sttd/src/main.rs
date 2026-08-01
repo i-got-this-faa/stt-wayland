@@ -117,6 +117,10 @@ enum PipeCmd {
     Shutdown,
 }
 
+/// PipeWire emits a short connection transient when the capture stream is
+/// first attached. Do not let that transient reach VAD/Whisper as speech.
+const CAPTURE_STARTUP_IGNORE_MS: u32 = 750;
+
 // ─── entry ──────────────────────────────────────────────────────────────────
 
 fn main() -> ExitCode {
@@ -1035,6 +1039,7 @@ fn pipeline_main(
         .checked_sub(Duration::from_secs(1))
         .unwrap_or_else(Instant::now);
     let preview_interval = Duration::from_millis(400);
+    let mut startup_ignore_samples: usize = 0;
     // Wall-clock edit capture budget (~max_edit_seconds of mono PCM).
     let mut edit_samples: usize = 0;
     let mut cap_notified = false;
@@ -1050,15 +1055,19 @@ fn pipeline_main(
                 Ok(PipeCmd::Arm { mode: m }) => {
                     mode = m;
                     armed = true;
+                    startup_ignore_samples = (SAMPLE_RATE_HZ as usize)
+                        .saturating_mul(CAPTURE_STARTUP_IGNORE_MS as usize)
+                        / 1000;
                     cap_notified = false;
                     edit_samples = 0;
                     chunker.reset();
                     chunker.set_accumulate_session(m == Mode::Edit);
                     last_pending = false;
-                    debug!(?m, "pipeline armed");
+                    debug!(?m, ignore_ms = CAPTURE_STARTUP_IGNORE_MS, "pipeline armed");
                 }
                 Ok(PipeCmd::Flush { reply }) => {
                     armed = false;
+                    startup_ignore_samples = 0;
                     let buf = chunker.flush_all();
                     chunker.set_accumulate_session(false);
                     edit_samples = 0;
@@ -1078,6 +1087,7 @@ fn pipeline_main(
                 }
                 Ok(PipeCmd::Reset) => {
                     chunker.reset();
+                    startup_ignore_samples = 0;
                     last_pending = false;
                     cap_notified = false;
                     edit_samples = 0;
@@ -1094,6 +1104,11 @@ fn pipeline_main(
         match sample_rx.recv_timeout(Duration::from_millis(15)) {
             Ok(samples) => {
                 if !armed || samples.is_empty() {
+                    continue;
+                }
+
+                if startup_ignore_samples > 0 {
+                    startup_ignore_samples = startup_ignore_samples.saturating_sub(samples.len());
                     continue;
                 }
 

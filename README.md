@@ -51,7 +51,7 @@ EditReview --Discard--> Idle
 ```bash
 sudo pacman -S --needed base-devel rust cmake clang pkgconf \
   pipewire pipewire-pulse libpipewire \
-  gtk4 gtk4-layer-shell wayland wayland-protocols
+  gtk4 gtk4-layer-shell libadwaita wayland wayland-protocols
 ```
 
 ### Debian / Ubuntu
@@ -59,7 +59,7 @@ sudo pacman -S --needed base-devel rust cmake clang pkgconf \
 ```bash
 sudo apt install build-essential pkg-config cmake clang \
   libpipewire-0.3-dev libspa-0.2-dev \
-  libgtk-4-dev libgtk4-layer-shell-dev \
+  libgtk-4-dev libgtk4-layer-shell-dev libadwaita-1-dev \
   libwayland-dev wayland-protocols
 ```
 
@@ -67,7 +67,7 @@ sudo apt install build-essential pkg-config cmake clang \
 
 ```bash
 sudo dnf install gcc gcc-c++ cmake clang pkgconf-pkg-config \
-  pipewire-devel gtk4-devel gtk4-layer-shell-devel \
+  pipewire-devel gtk4-devel gtk4-layer-shell-devel libadwaita-devel \
   wayland-devel wayland-protocols-devel
 ```
 
@@ -78,7 +78,7 @@ sudo dnf install gcc gcc-c++ cmake clang pkgconf-pkg-config \
 | `pipewire` | Audio capture | **0.9** (0.8 breaks on PipeWire ≥1.4) |
 | `webrtc-vad` | Voice activity detection | 0.4 |
 | `whisper-rs` | whisper.cpp bindings (needs **cmake** + **clang/libclang**) | **0.16** |
-| `gtk4`, `gtk4-layer-shell` | Overlay + settings UI | 0.9 / 0.4 |
+| `gtk4`, `gtk4-layer-shell`, `libadwaita` | Overlay + settings UI | 0.9 / 0.4 / 0.9 |
 | `wayland-client`, `wayland-protocols-misc` | virtual-keyboard inject | 0.31 / 0.3 |
 
 `whisper-rs` compiles whisper.cpp from source on first build; expect several minutes and a C/C++ toolchain.

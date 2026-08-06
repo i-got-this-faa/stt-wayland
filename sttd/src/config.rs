@@ -541,7 +541,7 @@ impl ProfileStore {
             names.push("Default".into());
         }
 
-        let active = self.active()?;
+        let active = self.active().ok().flatten();
         let active_is_valid = active
             .as_deref()
             .is_some_and(|name| names.iter().any(|candidate| candidate == name));

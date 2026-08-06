@@ -36,6 +36,7 @@
             nativeBuildInputs = with pkgs; [
               pkg-config cmake clang
               autoPatchelfHook
+              wrapGAppsHook4
             ];
             buildInputs = with pkgs; [
               pipewire
@@ -45,6 +46,8 @@
               wayland
               wayland-protocols
               libclang.lib
+              gsettings-desktop-schemas
+              hicolor-icon-theme
             ];
             LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
           };

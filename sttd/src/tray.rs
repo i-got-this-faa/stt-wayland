@@ -92,7 +92,24 @@ fn toggle_label(state: DaemonState) -> &'static str {
     }
 }
 
-/// Convert one or more RGBA pixels to the network-byte-order ARGB32 format
+/// Demultiply premultiplied RGBA pixels into straight RGBA.
+fn demultiply_alpha(data: &mut [u8]) {
+    for pixel in data.chunks_exact_mut(4) {
+        let alpha = pixel[3];
+        if alpha == 0 {
+            pixel[0] = 0;
+            pixel[1] = 0;
+            pixel[2] = 0;
+        } else if alpha != 255 {
+            let alpha_f = alpha as u16;
+            pixel[0] = ((pixel[0] as u16 * 255 + alpha_f / 2) / alpha_f).min(255) as u8;
+            pixel[1] = ((pixel[1] as u16 * 255 + alpha_f / 2) / alpha_f).min(255) as u8;
+            pixel[2] = ((pixel[2] as u16 * 255 + alpha_f / 2) / alpha_f).min(255) as u8;
+        }
+    }
+}
+
+/// Convert straight RGBA pixels to the network-byte-order ARGB32 format
 /// required by StatusNotifierItem.
 fn rgba_to_argb(data: &mut [u8]) {
     for pixel in data.chunks_exact_mut(4) {
@@ -211,7 +228,15 @@ impl TrayHandle {
         {
             let handle = self.handle.lock().ok().and_then(|mut guard| guard.take());
             if let Some(handle) = handle {
-                handle.shutdown().wait();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    handle.shutdown().wait();
+                    let _ = tx.send(());
+                });
+                match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+                    Ok(()) => debug!("tray shutdown completed"),
+                    Err(_) => debug!("tray shutdown timed out; continuing anyway"),
+                }
             }
         }
     }
@@ -390,6 +415,7 @@ fn rasterize_svg(svg: &[u8], size: u32) -> Result<ksni::Icon> {
     resvg::render(&tree, transform, &mut pixmap_mut);
 
     let mut data = pixmap.data().to_vec();
+    demultiply_alpha(&mut data);
     rgba_to_argb(&mut data);
     Ok(ksni::Icon {
         width: size as i32,

@@ -537,6 +537,7 @@ impl Daemon {
     /// Idle: no PW stream, no mapped overlay. Blocks until Shutdown.
     fn run_core_loop(&mut self, core_rx: Receiver<CoreEvent>) -> Result<()> {
         self.tray.start();
+        self.last_tray_snap = None;
         self.sync_tray();
         info!("core loop running (idle)");
         let poll = Duration::from_millis(10);

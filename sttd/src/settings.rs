@@ -771,8 +771,15 @@ fn refresh_profiles(form: &Rc<Form>, state: &Rc<RefCell<EditorState>>) {
         model.append(name);
     }
     form.profiles.set_model(Some(&model));
-    let index = names.iter().position(|name| name == &current).unwrap_or(0) as u32;
-    form.profiles.set_selected(index);
+    let index = names.iter().position(|name| name == &current);
+    if let Some(index) = index {
+        form.profiles.set_selected(index as u32);
+    } else {
+        form.profiles.set_selected(0);
+        if let Some(fallback) = names.first() {
+            state.borrow_mut().current = fallback.clone();
+        }
+    }
     form.updating.set(false);
 
     form.profiles.set_subtitle(

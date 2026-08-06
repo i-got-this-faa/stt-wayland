@@ -1,10 +1,9 @@
-//! Speech-to-text engine (whisper-rs over whisper.cpp).
+//! Speech-to-text engine (transcribe-cpp over transcribe.cpp).
 //!
 //! # Architecture
 //!
-//! A **dedicated OS thread** owns the [`WhisperContext`] / [`WhisperState`] pair
-//! (whisper contexts are not cheaply shared across threads). Callers talk to it
-//! through bounded `mpsc` channels:
+//! A **dedicated OS thread** owns the model session. Callers talk to it through
+//! bounded `mpsc` channels:
 //!
 //! - **In**: bounded final/control [`SttCommand`] jobs plus a coalesced preview
 //!   channel
@@ -16,15 +15,17 @@
 //!
 //! # Models
 //!
-//! English-only GGML models (`base.en` / `small.en`) under
+//! transcribe.cpp GGUF models and legacy whisper.cpp GGML `.bin` models under
 //! `~/.local/share/sttd/models/`. Residency: `preload` (default) or `lazy`.
 //!
 //! # Feature flag
 //!
-//! Real inference requires the `stt-engine` feature (links `whisper-rs`). Without
-//! it the worker still starts and the API is complete, but load/transcribe
-//! return clear errors. Build with cmake + clang for whisper.cpp.
+//! Real inference requires the `stt-engine` feature (links `transcribe-cpp`).
+//! Without it the worker still starts and the API is complete, but
+//! load/transcribe return clear errors. Build with CMake and a C++ toolchain.
 
+use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{
@@ -32,8 +33,6 @@ use std::sync::mpsc::{
 };
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::fs;
-use std::io::{Read, Write};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -41,7 +40,12 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{ModelConfig, ModelResidency};
 
-/// Whisper + webrtc-vad capture rate (mono f32).
+// transcribe-cpp-sys 0.1.3 omits its Linux CBLAS dependency from the link manifest.
+#[cfg(all(feature = "stt-engine", target_os = "linux"))]
+#[link(name = "cblas")]
+extern "C" {}
+
+/// Speech engine + webrtc-vad capture rate (mono f32).
 pub const SAMPLE_RATE_HZ: u32 = 16_000;
 
 /// Default Live-mode audio overlap for chunk continuity (~200 ms @ 16 kHz).
@@ -139,7 +143,7 @@ impl SttEngine {
         let (cmd_tx, cmd_rx) = mpsc::sync_channel::<SttCommand>(capacity);
         // Preview work is lossy and must never occupy slots needed by final
         // Live chunks or control barriers. A one-entry channel also coalesces
-        // previews naturally while Whisper is busy.
+        // previews naturally while the model is busy.
         let (preview_tx, preview_rx) = mpsc::sync_channel::<Vec<f32>>(1);
         // Results are small and the core loop drains them continuously. Keep
         // this channel unbounded so a stop barrier cannot deadlock behind a
@@ -158,7 +162,7 @@ impl SttEngine {
         };
 
         let join = thread::Builder::new()
-            .name("sttd-whisper".into())
+            .name("sttd-transcribe".into())
             .spawn(move || worker_main(worker_cfg, cmd_rx, preview_rx, result_tx))
             .context("spawn stt worker thread")?;
 
@@ -177,7 +181,7 @@ impl SttEngine {
         if residency == ModelResidency::Preload {
             engine
                 .ensure_loaded()
-                .context("preload whisper model at startup")?;
+                .context("preload transcription model at startup")?;
         }
 
         Ok(engine)
@@ -203,7 +207,7 @@ impl SttEngine {
             .map_err(|_| anyhow!("stt worker thread is not running"))?;
         reply_rx
             .recv_timeout(Duration::from_secs(120))
-            .map_err(|_| anyhow!("timed out waiting for whisper model load"))?
+            .map_err(|_| anyhow!("timed out waiting for transcription model load"))?
     }
 
     /// Live: enqueue a VAD-closed chunk (blocks when the channel is full).
@@ -513,18 +517,18 @@ fn send_result(
     tx.send(result)
 }
 
-/// Worker-local state; lives only on the `sttd-whisper` thread.
+/// Worker-local state; lives only on the `sttd-transcribe` thread.
 struct SttWorker {
     cfg: WorkerConfig,
     session_id: u64,
     /// Tail of the last Live chunk, prepended to the next for continuity.
     overlap_tail: Vec<f32>,
-    /// Last committed Live text (whisper initial_prompt).
+    /// Last committed Live text (Whisper initial prompt when supported).
     last_prompt: String,
     #[cfg(feature = "stt-engine")]
-    ctx: Option<whisper_rs::WhisperContext>,
+    session: Option<transcribe_cpp::Session>,
     #[cfg(feature = "stt-engine")]
-    state: Option<whisper_rs::WhisperState>,
+    model_arch: Option<String>,
 }
 
 impl SttWorker {
@@ -535,9 +539,9 @@ impl SttWorker {
             overlap_tail: Vec::new(),
             last_prompt: String::new(),
             #[cfg(feature = "stt-engine")]
-            ctx: None,
+            session: None,
             #[cfg(feature = "stt-engine")]
-            state: None,
+            model_arch: None,
         }
     }
 
@@ -555,8 +559,8 @@ impl SttWorker {
     fn unload(&mut self) {
         #[cfg(feature = "stt-engine")]
         {
-            self.state = None;
-            self.ctx = None;
+            self.session = None;
+            self.model_arch = None;
         }
         self.cfg.loaded.store(false, Ordering::Release);
         self.clear_session();
@@ -579,16 +583,16 @@ impl SttWorker {
                 }
                 Ok(false) => {
                     bail!(
-                        "whisper model not found at {} — install base.en/small.en under \
-                         ~/.local/share/sttd/models/ (e.g. ggml-base.en.bin)",
+                        "transcription model not found at {} — install a supported GGUF or \
+                         legacy whisper.cpp .bin model under ~/.local/share/sttd/models/",
                         path.display()
                     );
                 }
                 Err(e) => {
                     bail!(
-                        "whisper model not found at {} and auto-download failed: {e:#} \
-                         — install base.en/small.en under ~/.local/share/sttd/models/ \
-                         (e.g. ggml-base.en.bin)",
+                        "transcription model not found at {} and legacy Whisper \
+                         auto-download failed: {e:#} — install a supported GGUF or \
+                         whisper.cpp .bin model under ~/.local/share/sttd/models/",
                         path.display()
                     );
                 }
@@ -597,25 +601,48 @@ impl SttWorker {
 
         #[cfg(feature = "stt-engine")]
         {
-            info!(path = %path.display(), "stt worker: loading whisper model");
+            info!(path = %path.display(), "stt worker: loading transcription model");
 
-            // Keep whisper.cpp / ggml noise out of the daemon console when hooks work.
-            whisper_rs::install_logging_hooks();
+            disable_engine_logging_once();
 
-            let ctx = whisper_rs::WhisperContext::new_with_params(
-                path,
-                whisper_rs::WhisperContextParameters::default(),
-            )
-            .map_err(|e| anyhow!("failed to load whisper model at {}: {e}", path.display()))?;
+            let model = transcribe_cpp::Model::load(path).map_err(|e| {
+                anyhow!(
+                    "failed to load transcription model at {}: {e}",
+                    path.display()
+                )
+            })?;
+            let arch = model.arch();
+            let variant = model.variant();
+            let backend = model.backend();
+            let capabilities = model.capabilities();
+            if capabilities.native_sample_rate != SAMPLE_RATE_HZ as i32 {
+                bail!(
+                    "model at {} requires {} Hz audio; sttd currently supplies {} Hz",
+                    path.display(),
+                    capabilities.native_sample_rate,
+                    SAMPLE_RATE_HZ
+                );
+            }
 
-            let state = ctx
-                .create_state()
-                .map_err(|e| anyhow!("failed to create whisper state: {e}"))?;
+            let session = model
+                .session_with(&transcribe_cpp::SessionOptions {
+                    n_threads: self.cfg.threads,
+                    ..Default::default()
+                })
+                .map_err(|e| anyhow!("failed to create transcription session: {e}"))?;
 
-            self.ctx = Some(ctx);
-            self.state = Some(state);
+            info!(
+                path = %path.display(),
+                arch = %arch,
+                variant = %variant,
+                backend = %backend,
+                supports_streaming = capabilities.supports_streaming,
+                "stt worker: model ready"
+            );
+
+            self.model_arch = Some(arch);
+            self.session = Some(session);
             self.cfg.loaded.store(true, Ordering::Release);
-            info!(path = %path.display(), "stt worker: model ready");
             Ok(())
         }
 
@@ -623,8 +650,8 @@ impl SttWorker {
         {
             let _ = path;
             bail!(
-                "sttd built without `stt-engine` feature (whisper-rs not linked); \
-                 rebuild with default features and system cmake/clang"
+                "sttd built without `stt-engine` feature (transcribe-cpp not linked); \
+                 rebuild with default features and a CMake/C++ toolchain"
             );
         }
     }
@@ -646,7 +673,7 @@ impl SttWorker {
         pcm.extend_from_slice(&samples);
 
         let use_prompt = is_final && !self.last_prompt.is_empty();
-        let text = self.run_whisper(&pcm, use_prompt)?;
+        let text = self.run_transcription(&pcm, use_prompt)?;
 
         if is_final {
             // Keep only the tail of the committed chunk. Preview jobs are
@@ -696,7 +723,7 @@ impl SttWorker {
         }
 
         self.ensure_loaded()?;
-        let text = self.run_whisper(&samples, false)?;
+        let text = self.run_transcription(&samples, false)?;
         info!(
             n_samples = samples.len(),
             chars = text.len(),
@@ -710,71 +737,59 @@ impl SttWorker {
     }
 
     #[cfg(feature = "stt-engine")]
-    fn run_whisper(&mut self, pcm: &[f32], use_prompt: bool) -> Result<String> {
-        let state = self
-            .state
+    fn run_transcription(&mut self, pcm: &[f32], use_prompt: bool) -> Result<String> {
+        let language = self.cfg.language.trim();
+        let mut options = transcribe_cpp::RunOptions {
+            timestamps: transcribe_cpp::TimestampKind::None,
+            language: (!language.is_empty() && language != "auto").then(|| language.to_string()),
+            ..Default::default()
+        };
+
+        // Prompt continuity and no-speech thresholds are Whisper-specific.
+        // Other model families use their own shipped decoding defaults.
+        if self.model_arch.as_deref() == Some("whisper") {
+            options.family = Some(transcribe_cpp::RunExtension::Whisper(
+                transcribe_cpp::WhisperRunOptions {
+                    initial_prompt: use_prompt.then(|| self.last_prompt.clone()),
+                    condition_on_prev_tokens: Some(use_prompt),
+                    temperature: Some(0.0),
+                    temperature_inc: Some(0.0),
+                    no_speech_thold: Some(MAX_NO_SPEECH_PROBABILITY),
+                    ..Default::default()
+                },
+            ));
+        }
+
+        let session = self
+            .session
             .as_mut()
-            .ok_or_else(|| anyhow!("whisper state missing after load"))?;
-
-        let mut params =
-            whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy { best_of: 1 });
-
-        params.set_n_threads(self.cfg.threads);
-        // English-only models (base.en / small.en); language from config, default "en".
-        let lang = self.cfg.language.as_str();
-        if lang == "auto" {
-            params.set_detect_language(true);
-            params.set_language(None);
-        } else {
-            params.set_language(Some(lang));
-            params.set_detect_language(false);
-        }
-        params.set_translate(false);
-        params.set_print_special(false);
-        params.set_print_progress(false);
-        params.set_print_realtime(false);
-        params.set_print_timestamps(false);
-        // Independent VAD chunks; optional prompt for cross-chunk continuity.
-        params.set_no_context(!use_prompt);
-        params.set_single_segment(false);
-        params.set_suppress_blank(true);
-        params.set_suppress_nst(true);
-
-        if use_prompt && !self.last_prompt.is_empty() {
-            params.set_initial_prompt(&self.last_prompt);
-        }
-
-        state
-            .full(params, pcm)
-            .map_err(|e| anyhow!("whisper full() failed: {e}"))?;
-
-        let mut out = String::new();
-        for segment in state.as_iter() {
-            let no_speech_probability = segment.no_speech_probability();
-            if no_speech_probability >= MAX_NO_SPEECH_PROBABILITY {
-                debug!(
-                    no_speech_probability,
-                    "whisper: suppressing no-speech segment"
+            .ok_or_else(|| anyhow!("transcription session missing after load"))?;
+        let limits = session
+            .limits()
+            .map_err(|e| anyhow!("reading transcription session limits failed: {e}"))?;
+        if limits.effective_max_audio_ms > 0 {
+            let max_samples = (limits.effective_max_audio_ms as u64)
+                .saturating_mul(u64::from(SAMPLE_RATE_HZ))
+                / 1000;
+            if pcm.len() as u64 > max_samples {
+                bail!(
+                    "audio buffer is too long for this model ({} ms > {} ms)",
+                    pcm.len() as u64 * 1000 / u64::from(SAMPLE_RATE_HZ),
+                    limits.effective_max_audio_ms
                 );
-                continue;
             }
-            let piece = segment.to_str().map(|s| s.trim()).unwrap_or("");
-            if piece.is_empty() {
-                continue;
-            }
-            if !out.is_empty() {
-                out.push(' ');
-            }
-            out.push_str(piece);
         }
+        let transcript = session
+            .run(pcm, &options)
+            .map_err(|e| anyhow!("transcription run failed: {e}"))?;
 
-        Ok(collapse_ws(&out))
+        Ok(collapse_ws(&transcript.text))
     }
 
     #[cfg(not(feature = "stt-engine"))]
-    fn run_whisper(&mut self, _pcm: &[f32], _use_prompt: bool) -> Result<String> {
+    fn run_transcription(&mut self, _pcm: &[f32], _use_prompt: bool) -> Result<String> {
         bail!(
-            "sttd built without `stt-engine` feature (whisper-rs not linked); \
+            "sttd built without `stt-engine` feature (transcribe-cpp not linked); \
              rebuild with default features"
         );
     }
@@ -812,10 +827,14 @@ fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Whisper may hallucinate prompted text when a false-positive VAD chunk is
-/// mostly silence. Drop segments that report the standard no-speech confidence
-/// instead of injecting the previous utterance again.
+/// Whisper no-speech threshold applied by the family-specific decoder.
 const MAX_NO_SPEECH_PROBABILITY: f32 = 0.6;
+
+#[cfg(feature = "stt-engine")]
+fn disable_engine_logging_once() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(transcribe_cpp::disable_logging);
+}
 
 /// Known whisper.cpp model filenames available for auto-download.
 const KNOWN_MODELS: &[&str] = &[
@@ -833,10 +852,7 @@ const HF_REPO: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main
 /// Returns `Ok(true)` on success, `Ok(false)` if the model filename is not in
 /// the known list (no download attempted), and `Err` on network/IO failure.
 fn download_model(path: &Path) -> Result<bool> {
-    let filename = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
     if !KNOWN_MODELS.contains(&filename) {
         return Ok(false);

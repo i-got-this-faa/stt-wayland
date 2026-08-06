@@ -147,25 +147,27 @@ impl LiveCardWidgets {
 
         let text_col = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
         text_col.add_css_class("sttd-text-col");
-        text_col.set_hexpand(true);
+        text_col.set_size_request(300, -1);
         text_col.set_valign(gtk4::Align::Center);
 
         let committed = gtk4::Label::new(None);
         committed.add_css_class("sttd-committed");
         committed.set_halign(gtk4::Align::Start);
         committed.set_xalign(0.0);
-        committed.set_wrap(true);
-        committed.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
-        committed.set_max_width_chars(48);
+        committed.set_single_line_mode(true);
+        committed.set_ellipsize(gtk4::pango::EllipsizeMode::Start);
+        committed.set_width_chars(36);
+        committed.set_max_width_chars(36);
         committed.set_selectable(false);
 
         let preview = gtk4::Label::new(None);
         preview.add_css_class("sttd-preview");
         preview.set_halign(gtk4::Align::Start);
         preview.set_xalign(0.0);
-        preview.set_wrap(true);
-        preview.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
-        preview.set_max_width_chars(48);
+        preview.set_single_line_mode(true);
+        preview.set_ellipsize(gtk4::pango::EllipsizeMode::Start);
+        preview.set_width_chars(36);
+        preview.set_max_width_chars(36);
         preview.set_selectable(false);
         preview.set_opacity(1.0);
 
@@ -180,7 +182,9 @@ impl LiveCardWidgets {
             d.add_css_class("sttd-dot");
             dots.append(&d);
         }
-        dots.set_visible(false);
+        // Keep the indicator allocation stable; toggling visibility would
+        // change the card width whenever speech starts or stops.
+        dots.set_visible(true);
 
         // Mic: Pause when recording, Resume when paused (tracked via CSS class).
         {
@@ -234,19 +238,15 @@ impl LiveCardWidgets {
     }
 
     pub fn set_committed(&self, text: &str) {
-        use gtk4::prelude::*;
         self.committed.set_text(text);
-        self.committed.set_visible(!text.is_empty());
     }
 
     pub fn set_speech_pending(&self, pending: bool) {
         use gtk4::prelude::*;
         if pending {
             self.dots.add_css_class("pending");
-            self.dots.set_visible(true);
         } else {
             self.dots.remove_css_class("pending");
-            self.dots.set_visible(false);
         }
     }
 
@@ -266,12 +266,12 @@ impl LiveCardWidgets {
         // Immediate if empty→empty or first paint with empty current.
         let current = preview.text();
         if current.is_empty() && new_text.is_empty() {
-            preview.set_visible(false);
+            preview.remove_css_class("fading");
+            preview.set_opacity(1.0);
             return;
         }
         if current.is_empty() {
             preview.set_text(&new_text);
-            preview.set_visible(!new_text.is_empty());
             preview.remove_css_class("fading");
             preview.set_opacity(1.0);
             return;
@@ -287,7 +287,6 @@ impl LiveCardWidgets {
                 return glib::ControlFlow::Break;
             }
             preview_mid.set_text(&new_text);
-            preview_mid.set_visible(!new_text.is_empty());
             preview_mid.remove_css_class("fading");
             preview_mid.set_opacity(1.0);
             glib::ControlFlow::Break

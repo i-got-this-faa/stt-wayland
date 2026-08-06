@@ -13,6 +13,16 @@ window.sttd-overlay {
   box-shadow: 0 8px 32px alpha(#000000, 0.35);
 }
 
+.sttd-text-col {
+  min-width: 300px;
+  min-height: 40px;
+}
+
+label.sttd-committed,
+label.sttd-preview {
+  min-height: 18px;
+}
+
 /* Mic circle — Pause / Resume */
 button.sttd-mic {
   min-width: 44px;
@@ -75,6 +85,11 @@ label.sttd-preview.fading {
 /* 3-dot speech-pending pulse */
 .sttd-dots {
   min-width: 28px;
+  opacity: 0;
+}
+
+.sttd-dots.pending {
+  opacity: 1;
 }
 
 label.sttd-dot {

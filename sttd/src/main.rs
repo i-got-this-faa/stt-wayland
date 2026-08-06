@@ -1,6 +1,6 @@
 //! `sttd` — Wayland speech-to-text daemon.
 //!
-//! Stack: PipeWire capture → webrtc-vad → whisper-rs → gtk4 overlay +
+//! Stack: PipeWire capture -> webrtc-vad -> transcribe.cpp -> gtk4 overlay +
 //! virtual-keyboard injection. Control plane: Unix socket NDJSON (`proto`).
 //!
 //! # Runtime layout
@@ -10,7 +10,7 @@
 //! | main (tokio)      | Core event loop: IPC, state machine, STT results  |
 //! | sttd-pipewire     | PipeWire stream (open on Start, close on Stop)    |
 //! | sttd-pipeline     | VAD chunking → STT command enqueue                |
-//! | sttd-whisper      | whisper-rs worker                                 |
+//! | sttd-transcribe   | transcribe.cpp model session                      |
 //! | sttd-overlay      | GTK4 + layer-shell main loop (warm when idle)     |
 //!
 //! Overlay and IPC share one state-transition path via [`CoreEvent`].
@@ -30,7 +30,7 @@ mod vad;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -57,7 +57,7 @@ use crate::vad::{Chunker, SpeechPending, DEFAULT_FRAME_MS, SAMPLE_RATE_HZ};
 #[derive(Debug, Parser)]
 #[command(
     name = "sttd",
-    about = "Wayland speech-to-text daemon (PipeWire + whisper.cpp)",
+    about = "Wayland speech-to-text daemon (PipeWire + transcribe.cpp)",
     version
 )]
 struct Cli {
@@ -125,7 +125,7 @@ enum PipeCmd {
 }
 
 /// PipeWire emits a short connection transient when the capture stream is
-/// first attached. Do not let that transient reach VAD/Whisper as speech.
+/// first attached. Do not let that transient reach VAD/STT as speech.
 const CAPTURE_STARTUP_IGNORE_MS: u32 = 750;
 
 // ─── entry ──────────────────────────────────────────────────────────────────
@@ -180,6 +180,78 @@ fn run() -> Result<()> {
         .context("build tokio runtime")?;
 
     rt.block_on(async_main(cfg, socket))
+}
+
+/// Resolve the settings binary next to the daemon first. This keeps a locally
+/// installed pair (`~/.local/bin/sttd` and `stt-settings`) together while still
+/// allowing a PATH-installed binary during development.
+fn settings_executable() -> PathBuf {
+    if let Ok(current) = std::env::current_exe() {
+        if let Some(parent) = current.parent() {
+            let sibling = parent.join("stt-settings");
+            if sibling.is_file() {
+                return sibling;
+            }
+        }
+    }
+
+    if let Some(path) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&path) {
+            let candidate = directory.join("stt-settings");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+
+    PathBuf::from("stt-settings")
+}
+
+/// Launch settings through the user service manager so a daemon started with
+/// systemd's read-only home sandbox does not pass that sandbox to the editor.
+fn launch_settings() -> Result<()> {
+    let executable = settings_executable();
+    let launcher = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--collect",
+            "--quiet",
+            "--no-block",
+            "--service-type=exec",
+            "--",
+        ])
+        .arg(&executable)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    match launcher {
+        Ok(status) if status.success() => {
+            info!(path = %executable.display(), "settings launch requested");
+            Ok(())
+        }
+        Ok(status) => {
+            warn!(code = ?status.code(), "systemd-run could not launch settings; falling back");
+            spawn_settings_direct(executable)
+        }
+        Err(error) => {
+            warn!(error = %error, "systemd-run unavailable; falling back to direct settings launch");
+            spawn_settings_direct(executable)
+        }
+    }
+}
+
+fn spawn_settings_direct(executable: PathBuf) -> Result<()> {
+    std::thread::Builder::new()
+        .name("sttd-settings-launch".into())
+        .spawn(move || {
+            if let Err(error) = Command::new(&executable).stdin(Stdio::null()).status() {
+                warn!(path = %executable.display(), error = %error, "settings launch failed");
+            }
+        })
+        .context("spawn settings launcher")?;
+    Ok(())
 }
 
 async fn async_main(cfg: Config, socket: PathBuf) -> Result<()> {
@@ -469,7 +541,7 @@ impl Daemon {
         };
 
         if stt.is_loaded() {
-            info!(path = %stt.model_path().display(), "whisper model loaded");
+            info!(path = %stt.model_path().display(), "transcription model loaded");
             if state
                 .last_error
                 .as_deref()
@@ -480,7 +552,7 @@ impl Daemon {
         } else {
             info!(
                 path = %stt.model_path().display(),
-                "whisper model deferred (lazy residency)"
+                "transcription model deferred (lazy residency)"
             );
         }
 
@@ -608,6 +680,12 @@ impl Daemon {
             tray::TrayEvent::Toggle => {
                 if let Err(error) = self.do_toggle(self.state.mode) {
                     warn!(error = %error, "tray toggle failed");
+                }
+                false
+            }
+            tray::TrayEvent::Settings => {
+                if let Err(error) = launch_settings() {
+                    warn!(error = %error, "tray settings launch failed");
                 }
                 false
             }
@@ -810,7 +888,7 @@ impl Daemon {
             self.state.mode = previous_mode;
             self.state.edit_buffer = previous_edit_buffer;
             self.state.set_error(format!("model load failed: {e:#}"));
-            return Err(e).context("ensure whisper model loaded");
+            return Err(e).context("ensure transcription model loaded");
         }
 
         if let Ok(session_id) = self.stt.reset_session() {
@@ -1239,7 +1317,7 @@ fn pipeline_main(
                 // Live in-progress preview (throttled).
                 if mode == Mode::Live && pending && last_preview.elapsed() >= preview_interval {
                     let cur = chunker.peek_current();
-                    // Need a bit of audio before whisper is useful (~0.5 s).
+                    // Need a bit of audio before transcription is useful (~0.5 s).
                     if cur.len() >= SAMPLE_RATE_HZ as usize / 2 {
                         let preview = cur.to_vec();
                         if stt_preview.try_send(preview).is_ok() {

@@ -40,7 +40,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # pipewire 0.8 fails to compile against PipeWire ≥1.4 (spa_pod_builder layout).
 pipewire = "0.9"
 webrtc-vad = "0.4"
-whisper-rs = "0.16"
+transcribe-cpp = { version = "0.1.3", default-features = false }
 
 # GUI overlay — keep gtk4 / gtk4-layer-shell / glib / libadwaita on a matched gtk-rs line.
 gtk4 = { version = "0.9", features = ["v4_10"] }
@@ -62,3 +62,4 @@ libc = "0.2"
 
 # HTTP (model download)
 ureq = "2"
+sha2 = "0.10"

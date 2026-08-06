@@ -130,10 +130,12 @@ pub struct OverlayLayout {
 
 impl Default for OverlayLayout {
     fn default() -> Self {
-        // Bottom-centered floating card: stretch horizontally, pin bottom.
+        // Bottom-centered floating card: keep the surface natural-sized and
+        // pin only its bottom edge. Anchoring both horizontal edges would make
+        // the transparent layer surface span the monitor and capture clicks.
         Self {
-            anchor_left: true,
-            anchor_right: true,
+            anchor_left: false,
+            anchor_right: false,
             anchor_top: false,
             anchor_bottom: true,
             margin_left: 0,
@@ -163,27 +165,19 @@ fn layout_from_config(cfg: &OverlayConfig) -> OverlayLayout {
 
     match cfg.anchor {
         OverlayAnchor::Top => {
-            layout.anchor_left = true;
-            layout.anchor_right = true;
             layout.anchor_top = true;
             layout.margin_top = margin;
         }
         OverlayAnchor::Bottom => {
-            layout.anchor_left = true;
-            layout.anchor_right = true;
             layout.anchor_bottom = true;
             layout.margin_bottom = margin;
         }
         OverlayAnchor::Left => {
             layout.anchor_left = true;
-            layout.anchor_top = true;
-            layout.anchor_bottom = true;
             layout.margin_left = margin;
         }
         OverlayAnchor::Right => {
             layout.anchor_right = true;
-            layout.anchor_top = true;
-            layout.anchor_bottom = true;
             layout.margin_right = margin;
         }
         OverlayAnchor::TopLeft => {
@@ -667,13 +661,13 @@ fn create_surface(state: &std::rc::Rc<std::cell::RefCell<UiState>>) {
     apply_layout(&window, &layout);
 
     let stack = gtk4::Stack::new();
-    // Layer-shell anchors determine the surface allocation. Keep the stack
-    // explicitly fill-aligned so the card's own Center alignment is applied
-    // across a full-width top/bottom surface.
-    stack.set_hexpand(true);
-    stack.set_vexpand(true);
-    stack.set_halign(gtk4::Align::Fill);
-    stack.set_valign(gtk4::Align::Fill);
+    // Let the visible child determine the natural surface size. Homogeneous
+    // stacks otherwise allocate the live card to the edit pane's larger
+    // minimum size, leaving an invisible input band around the card.
+    stack.set_hhomogeneous(false);
+    stack.set_vhomogeneous(false);
+    stack.set_halign(gtk4::Align::Center);
+    stack.set_valign(gtk4::Align::Center);
     stack.set_transition_type(gtk4::StackTransitionType::Crossfade);
     stack.set_transition_duration(120);
 
@@ -769,6 +763,29 @@ mod tests {
         assert_eq!(layout.margin_top, 24);
         assert_eq!(layout.margin_left, 0);
         assert_eq!(layout.margin_bottom, 0);
+    }
+
+    #[test]
+    fn edge_anchors_keep_the_cross_axis_natural_sized() {
+        for anchor in [OverlayAnchor::Top, OverlayAnchor::Bottom] {
+            let cfg = OverlayConfig {
+                anchor,
+                ..OverlayConfig::default()
+            };
+            let layout = layout_from_config(&cfg);
+            assert!(!layout.anchor_left);
+            assert!(!layout.anchor_right);
+        }
+
+        for anchor in [OverlayAnchor::Left, OverlayAnchor::Right] {
+            let cfg = OverlayConfig {
+                anchor,
+                ..OverlayConfig::default()
+            };
+            let layout = layout_from_config(&cfg);
+            assert!(!layout.anchor_top);
+            assert!(!layout.anchor_bottom);
+        }
     }
 
     #[test]

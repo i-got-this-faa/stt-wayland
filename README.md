@@ -4,17 +4,17 @@ Local, privacy-preserving **Wayland speech-to-text daemon** for Linux desktops (
 
 | Component | Role |
 |-----------|------|
-| **sttd** | Session daemon: PipeWire capture → webrtc-vad → whisper.cpp → overlay + tray + virtual-keyboard inject |
+| **sttd** | Session daemon: PipeWire capture → webrtc-vad → transcribe.cpp → overlay + tray + virtual-keyboard inject |
 | **sttctl** | CLI control client (`start` / `stop` / `toggle` / …) |
 | **stt-settings** | GTK4/libadwaita profile editor for models and daemon configuration |
 | **proto** | Shared newline-delimited JSON IPC types |
 
-**No cloud STT.** Models are on-device (`base.en` / `small.en` via [whisper-rs](https://crates.io/crates/whisper-rs) / whisper.cpp). Native Wayland only (no X11 injection helpers, no Wine).
+**No cloud STT.** Models run on-device through [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp), including modern GGUF ASR families and legacy whisper.cpp `.bin` files. Native Wayland only (no X11 injection helpers, no Wine).
 
 ## Architecture (v1)
 
 ```
-  mic (PipeWire) ──► webrtc-vad ──► mpsc<Vec<f32>> ──► whisper-rs
+  mic (PipeWire) ──► webrtc-vad ──► mpsc<Vec<f32>> ──► transcribe.cpp
                          │                                  │
                          │                          committed text
                          ▼                                  │
@@ -50,6 +50,7 @@ EditReview --Discard--> Idle
 
 ```bash
 sudo pacman -S --needed base-devel rust cmake clang pkgconf \
+  cblas \
   pipewire pipewire-pulse libpipewire \
   gtk4 gtk4-layer-shell libadwaita wayland wayland-protocols
 ```
@@ -58,6 +59,7 @@ sudo pacman -S --needed base-devel rust cmake clang pkgconf \
 
 ```bash
 sudo apt install build-essential pkg-config cmake clang \
+  libopenblas-dev \
   libpipewire-0.3-dev libspa-0.2-dev \
   libgtk-4-dev libgtk4-layer-shell-dev libadwaita-1-dev \
   libwayland-dev wayland-protocols
@@ -67,6 +69,7 @@ sudo apt install build-essential pkg-config cmake clang \
 
 ```bash
 sudo dnf install gcc gcc-c++ cmake clang pkgconf-pkg-config \
+  openblas-devel \
   pipewire-devel gtk4-devel gtk4-layer-shell-devel libadwaita-devel \
   wayland-devel wayland-protocols-devel
 ```
@@ -77,18 +80,18 @@ sudo dnf install gcc gcc-c++ cmake clang pkgconf-pkg-config \
 |-------|---------|-------------|
 | `pipewire` | Audio capture | **0.9** (0.8 breaks on PipeWire ≥1.4) |
 | `webrtc-vad` | Voice activity detection | 0.4 |
-| `whisper-rs` | whisper.cpp bindings (needs **cmake** + **clang/libclang**) | **0.16** |
+| `transcribe-cpp` | Multi-family transcribe.cpp bindings (needs **CMake**, C++, and CBLAS on Linux) | **0.1.3** |
 | `gtk4`, `gtk4-layer-shell`, `libadwaita` | Overlay + settings UI | 0.9 / 0.4 / 0.9 |
 | `wayland-client`, `wayland-protocols-misc` | virtual-keyboard inject | 0.31 / 0.3 |
 
-`whisper-rs` compiles whisper.cpp from source on first build; expect several minutes and a C/C++ toolchain.
+`transcribe-cpp` compiles transcribe.cpp from source on first build. The default build is CPU-only and self-contained apart from the Linux CBLAS link dependency.
 
 ### Feature flags (`sttd`)
 
 | Feature | Default | Notes |
 |---------|---------|-------|
 | `audio` | yes | PipeWire |
-| `stt-engine` | yes | whisper-rs + webrtc-vad |
+| `stt-engine` | yes | transcribe-cpp + webrtc-vad |
 | `overlay` | yes | gtk4 + layer-shell |
 | `inject` | yes | wayland virtual-keyboard |
 | `tray` | yes | StatusNotifierItem over D-Bus |
@@ -111,22 +114,25 @@ Binaries: `target/release/sttd`, `target/release/sttctl`, `target/release/stt-se
 
 ## Model setup
 
-Place GGML Whisper models under:
+Launch the model manager:
+
+```bash
+stt-settings
+```
+
+The **Speech Model** dropdown can download, select, cancel, and delete verified
+models. The catalog includes Nemotron 3.5 ASR Streaming in Q5 and Q8 variants,
+Parakeet TDT v3, Whisper Large v3 Turbo, Qwen3-ASR, Moonshine Streaming, and
+Whisper Base English. Downloads use pinned model revisions, verify the exact
+size and SHA-256 hash, and are installed atomically under:
 
 ```
 ~/.local/share/sttd/models/
 ```
 
-Example (base.en):
-
-```bash
-mkdir -p ~/.local/share/sttd/models
-# Official ggml models, e.g. from Hugging Face ggml-org/whisper.cpp
-curl -L -o ~/.local/share/sttd/models/ggml-base.en.bin \
-  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
-```
-
-v1 targets **base.en** or **small.en**. Configure name/residency in `config.toml`.
+Existing custom GGUF and legacy whisper.cpp `.bin` paths remain readable from
+profiles, but catalog download and deletion are intentionally confined to the
+managed models directory.
 
 ## Configuration
 
@@ -143,12 +149,13 @@ See [`contrib/config.example.toml`](contrib/config.example.toml). Sections:
 ### Profiles and settings GUI
 
 Launch `stt-settings` to manage named profiles under
-`~/.config/sttd/profiles/`. It discovers local `.bin` Whisper models and edits
-the model, audio/VAD, overlay, injection, and tray settings. **Save** updates
-only the selected profile; **Apply** also mirrors it to
+`~/.config/sttd/profiles/`. Its model dropdown handles verified downloads,
+selection, cancellation, and safe deletion, while the rest of the app edits
+audio/VAD, overlay, injection, and tray settings. **Save** updates only the
+selected profile; **Apply** also mirrors it to
 `~/.config/sttd/config.toml` for the existing systemd unit. Restart `sttd` after
-applying a profile. Use the refresh button next to the model list after adding
-a model while the editor is open.
+applying a profile. A model cannot be deleted while a saved profile references
+it.
 
 The daemon can also use a profile directly without changing the active config:
 
@@ -177,7 +184,7 @@ sttctl toggle
 ```
 
 Control client (`sttctl` uses a **500 ms** status timeout and up to **120 s** for
-commands that may load Whisper or flush a final transcript):
+commands that may load a model or flush a final transcript):
 
 ```bash
 sttctl start --mode live   # or: sttctl start --mode edit
@@ -210,7 +217,7 @@ switching profiles affects the next daemon start/restart.
 Tray behaviour: when enabled, `sttd` registers a StatusNotifierItem on the
 session D-Bus. The icon shows idle, recording, paused, or error state; a
 left-click toggles capture, and the menu contains the current state/model,
-Start/Stop, and Quit. A missing session bus or tray host is a silent no-op, so
+Start/Stop, Settings, and Quit. A missing session bus or tray host is a silent no-op, so
 the daemon remains usable on headless sessions.
 
 ### systemd user unit
@@ -280,7 +287,8 @@ stt-wayland/
       settings.rs     # GTK4 profile/model settings application
       audio.rs        # PipeWire stream
       vad.rs          # webrtc-vad chunker
-      stt.rs          # whisper-rs worker thread
+      stt.rs          # transcribe.cpp worker thread
+      model_catalog.rs # pinned models + verified download/delete helpers
       state.rs        # state machine
       inject.rs       # virtual-keyboard
       config.rs

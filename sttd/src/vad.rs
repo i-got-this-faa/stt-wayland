@@ -23,7 +23,7 @@
 //!
 //! This module defaults to **10 ms (160 samples)** for lowest end-of-utterance
 //! latency. f32 samples are converted to i16 **only** for VAD decisions; emitted
-//! chunks keep the original f32 PCM for whisper-rs.
+//! chunks keep the original f32 PCM for the transcription engine.
 //!
 //! # Silence gap
 //!
@@ -541,7 +541,7 @@ impl Chunker {
             return None;
         }
 
-        // Hangover: keep trailing silence inside the chunk for whisper.
+        // Hangover: keep trailing silence inside the transcription chunk.
         self.current.extend_from_slice(frame);
         self.silence_samples = self
             .silence_samples

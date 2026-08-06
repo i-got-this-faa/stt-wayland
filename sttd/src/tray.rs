@@ -16,6 +16,7 @@ use crate::config::TrayConfig;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayEvent {
     Toggle,
+    Settings,
     Quit,
 }
 
@@ -330,6 +331,7 @@ impl ksni::Tray for Tray {
         };
 
         let toggle_tx = self.ev_tx.clone();
+        let settings_tx = self.ev_tx.clone();
         let quit_tx = self.ev_tx.clone();
 
         let info = StandardItem {
@@ -345,6 +347,14 @@ impl ksni::Tray for Tray {
             }),
             ..Default::default()
         };
+        let settings = StandardItem {
+            label: "Settings".into(),
+            icon_name: "preferences-system-symbolic".into(),
+            activate: Box::new(move |_tray| {
+                let _ = settings_tx.send(TrayEvent::Settings);
+            }),
+            ..Default::default()
+        };
         let quit = StandardItem {
             label: "Quit".into(),
             icon_name: "application-exit-symbolic".into(),
@@ -357,6 +367,7 @@ impl ksni::Tray for Tray {
         vec![
             info.into(),
             toggle.into(),
+            settings.into(),
             ksni::MenuItem::Separator,
             quit.into(),
         ]

@@ -7,17 +7,28 @@
 
 #[path = "config.rs"]
 mod config;
+#[path = "model_catalog.rs"]
+mod model_catalog;
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use adw::prelude::*;
 use anyhow::{Context, Result};
-use gtk4::gio;
+use gtk4::{gio, glib};
 
 use config::{default_models_dir, Config, ModelResidency, OverlayAnchor, ProfileStore};
+use model_catalog::{
+    delete_managed_model, download_model, format_size, install_state, managed_model_path,
+    model_for_filename, InstallState, ModelSpec, MODEL_CATALOG,
+};
 
 const ANCHORS: [(OverlayAnchor, &str); 9] = [
     (OverlayAnchor::Top, "Top"),
@@ -56,15 +67,40 @@ struct EditorState {
     config: Config,
 }
 
+#[derive(Debug, Clone)]
+enum ModelChoice {
+    Catalog(&'static ModelSpec),
+    Custom(PathBuf),
+}
+
+impl ModelChoice {
+    fn path(&self) -> Option<PathBuf> {
+        match self {
+            Self::Catalog(spec) => managed_model_path(&default_models_dir(), spec),
+            Self::Custom(path) => Some(path.clone()),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum DownloadEvent {
+    Progress { downloaded: u64, total: u64 },
+    Finished(std::result::Result<PathBuf, String>),
+}
+
 /// Every editable row, kept flat so `collect_config` / `populate_form` can
 /// read and write them without walking the widget tree.
 struct Form {
     /// Guards signal handlers while rows are rebuilt programmatically.
     updating: Cell<bool>,
-    /// Paths backing the rows of `model_picker`.
-    model_paths: RefCell<Vec<PathBuf>>,
+    /// Catalog and custom paths backing the rows of `model_picker`.
+    model_choices: RefCell<Vec<ModelChoice>>,
+    model_busy: Cell<bool>,
+    model_cancel: RefCell<Option<Arc<AtomicBool>>>,
     profiles: adw::ComboRow,
     model_picker: adw::ComboRow,
+    model_action_button: gtk4::Button,
+    model_progress: gtk4::ProgressBar,
     model_path: adw::EntryRow,
     residency: adw::ComboRow,
     threads: adw::SpinRow,
@@ -91,10 +127,32 @@ impl Form {
         profiles.set_title("Profile");
 
         let model_picker = adw::ComboRow::new();
-        model_picker.set_title("Installed Model");
-        model_picker.set_subtitle("Discovered in the models directory");
+        model_picker.set_title("Speech Model");
+        model_picker.set_subtitle("Choose an installed model or one to download");
 
-        let model_path = entry_row("Model Path", "Path to the ggml Whisper model file (.bin)");
+        let model_action_button = gtk4::Button::from_icon_name("folder-download-symbolic");
+        model_action_button.set_tooltip_text(Some("Download selected model"));
+        model_action_button.set_valign(gtk4::Align::Center);
+        model_action_button.add_css_class("flat");
+
+        let model_progress = gtk4::ProgressBar::new();
+        model_progress.set_show_text(true);
+        model_progress.set_size_request(110, -1);
+        model_progress.set_valign(gtk4::Align::Center);
+        model_progress.set_opacity(0.0);
+
+        let model_controls = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        model_controls.set_size_request(154, -1);
+        model_controls.set_halign(gtk4::Align::End);
+        model_controls.set_valign(gtk4::Align::Center);
+        model_controls.append(&model_progress);
+        model_controls.append(&model_action_button);
+        model_picker.add_suffix(&model_controls);
+
+        let model_path = entry_row(
+            "File Path",
+            "Path to a transcribe.cpp GGUF or legacy whisper.cpp BIN model",
+        );
 
         let residency = string_combo(&RESIDENCIES);
         residency.set_title("Residency");
@@ -103,12 +161,12 @@ impl Form {
         let threads = spin_row("Threads", "Inference threads (0 = auto)", 0.0, 128.0, 1.0);
         let language = entry_row(
             "Language",
-            "Whisper language code such as \"en\" (empty = auto-detect)",
+            "Language or locale hint such as \"en\" or \"en-US\" (auto = detect)",
         );
 
         let sample_rate = spin_row(
             "Sample Rate",
-            "Capture rate in Hz — Whisper expects 16000",
+            "Capture rate in Hz - speech models expect 16000",
             8_000.0,
             96_000.0,
             1_000.0,
@@ -186,9 +244,13 @@ impl Form {
 
         Self {
             updating: Cell::new(false),
-            model_paths: RefCell::new(Vec::new()),
+            model_choices: RefCell::new(Vec::new()),
+            model_busy: Cell::new(false),
+            model_cancel: RefCell::new(None),
             profiles,
             model_picker,
+            model_action_button,
+            model_progress,
             model_path,
             residency,
             threads,
@@ -316,18 +378,10 @@ fn build_ui(app: &adw::Application) -> Result<()> {
 
     let model_group = adw::PreferencesGroup::new();
     model_group.set_title("Model");
-    let refresh_button = gtk4::Button::from_icon_name("view-refresh-symbolic");
-    refresh_button.set_tooltip_text(Some("Refresh the discovered model list"));
-    refresh_button.set_valign(gtk4::Align::Center);
-    refresh_button.add_css_class("flat");
-    form.model_picker.add_suffix(&refresh_button);
-    let browse_button = gtk4::Button::from_icon_name("document-open-symbolic");
-    browse_button.set_tooltip_text(Some("Browse for a model file"));
-    browse_button.set_valign(gtk4::Align::Center);
-    browse_button.add_css_class("flat");
-    form.model_path.add_suffix(&browse_button);
+    model_group.set_description(Some(
+        "Models are downloaded into the app data directory and verified before installation.",
+    ));
     model_group.add(&form.model_picker);
-    model_group.add(&form.model_path);
     model_group.add(&form.residency);
     model_group.add(&form.threads);
     model_group.add(&form.language);
@@ -377,8 +431,7 @@ fn build_ui(app: &adw::Application) -> Result<()> {
         &state,
         &save_button,
         &apply_button,
-        &refresh_button,
-        &browse_button,
+        &form.model_action_button,
     );
 
     refresh_profiles(&form, &state);
@@ -395,8 +448,7 @@ fn connect_signals(
     state: &Rc<RefCell<EditorState>>,
     save_button: &gtk4::Button,
     apply_button: &gtk4::Button,
-    refresh_button: &gtk4::Button,
-    browse_button: &gtk4::Button,
+    model_action_button: &gtk4::Button,
 ) {
     // Selecting a profile loads it into the form.
     {
@@ -419,7 +471,8 @@ fn connect_signals(
         });
     }
 
-    // Picking a discovered model fills in the model path entry.
+    // Picking an installed model selects it; an uninstalled catalog model stays
+    // selected so its download action remains available.
     {
         let form = Rc::clone(form);
         let picker = form.model_picker.clone();
@@ -428,17 +481,32 @@ fn connect_signals(
                 return;
             }
             let index = row.selected() as usize;
-            let path = form.model_paths.borrow().get(index).cloned();
-            if let Some(path) = path {
-                let text = path.to_string_lossy().into_owned();
-                if form.model_path.text().as_str() != text {
-                    form.model_path.set_text(&text);
+            let choice = form.model_choices.borrow().get(index).cloned();
+            match choice {
+                Some(ModelChoice::Catalog(spec)) => {
+                    if let Some(path) = managed_model_path(&default_models_dir(), spec) {
+                        if install_state(&default_models_dir(), spec) == InstallState::Installed {
+                            let text = path.to_string_lossy().into_owned();
+                            if form.model_path.text().as_str() != text {
+                                form.model_path.set_text(&text);
+                            }
+                            form.language.set_text(spec.default_language);
+                        }
+                    }
                 }
+                Some(ModelChoice::Custom(path)) => {
+                    let text = path.to_string_lossy().into_owned();
+                    if form.model_path.text().as_str() != text {
+                        form.model_path.set_text(&text);
+                    }
+                }
+                None => {}
             }
+            update_model_manager(&form);
         });
     }
 
-    // Typing a path that matches a discovered model selects it.
+    // Typing a path that matches a catalog or discovered custom model selects it.
     {
         let form = Rc::clone(form);
         let entry = form.model_path.clone();
@@ -447,49 +515,28 @@ fn connect_signals(
                 return;
             }
             let text = row.text();
-            let paths = form.model_paths.borrow();
-            let index = paths
-                .iter()
-                .position(|path| path.to_string_lossy() == text.as_str());
+            let choices = form.model_choices.borrow();
+            let index = choices.iter().position(|choice| {
+                choice
+                    .path()
+                    .is_some_and(|path| path.to_string_lossy() == text.as_str())
+            });
             let selected = index.map_or(gtk4::INVALID_LIST_POSITION, |index| index as u32);
             if form.model_picker.selected() != selected {
                 form.model_picker.set_selected(selected);
             }
+            update_model_manager(&form);
         });
     }
 
     {
+        let window = window.clone();
+        let overlay = overlay.clone();
         let form = Rc::clone(form);
         let state = Rc::clone(state);
-        let overlay = overlay.clone();
-        let refresh_button = refresh_button.clone();
-        refresh_button.connect_clicked(move |_| {
-            let mut cfg = state.borrow().config.clone();
-            cfg.model.path = form.model_path.text().to_string();
-            refresh_models(&form, &cfg);
-            toast(&overlay, "Model list refreshed.");
-        });
-    }
-
-    {
-        let form = Rc::clone(form);
-        let window = window.clone();
-        browse_button.connect_clicked(move |_| {
-            let dialog = gtk4::FileDialog::new();
-            dialog.set_title("Select a Whisper Model");
-            dialog.set_modal(true);
-            let filter = gtk4::FileFilter::new();
-            filter.add_suffix("bin");
-            filter.set_name(Some("Whisper models (*.bin)"));
-            dialog.set_default_filter(Some(&filter));
-            let form = Rc::clone(&form);
-            dialog.open(Some(&window), gio::Cancellable::NONE, move |result| {
-                if let Ok(file) = result {
-                    if let Some(path) = file.path() {
-                        form.model_path.set_text(path.to_string_lossy().as_ref());
-                    }
-                }
-            });
+        let model_action_button = model_action_button.clone();
+        model_action_button.connect_clicked(move |_| {
+            manage_selected_model(&window, &overlay, &form, &state);
         });
     }
 
@@ -498,6 +545,9 @@ fn connect_signals(
         let state = Rc::clone(state);
         let overlay = overlay.clone();
         save_button.connect_clicked(move |_| {
+            if !selected_model_is_ready(&form, &overlay) {
+                return;
+            }
             let name = state.borrow().current.clone();
             let cfg = collect_config(&state, &form);
             let store = state.borrow().store.clone();
@@ -519,6 +569,9 @@ fn connect_signals(
         let overlay = overlay.clone();
         let banner = banner.clone();
         apply_button.connect_clicked(move |_| {
+            if !selected_model_is_ready(&form, &overlay) {
+                return;
+            }
             let name = state.borrow().current.clone();
             let cfg = collect_config(&state, &form);
             let store = state.borrow().store.clone();
@@ -563,6 +616,9 @@ fn connect_signals(
         let overlay = overlay.clone();
         let action = gio::SimpleAction::new("duplicate-profile", None);
         action.connect_activate(move |_, _| {
+            if !selected_model_is_ready(&form, &overlay) {
+                return;
+            }
             let store = state.borrow().store.clone();
             let base = format!("{} Copy", state.borrow().current);
             let name = unique_profile_name(&store, &base);
@@ -604,6 +660,9 @@ fn prompt_new_profile(
     form: &Rc<Form>,
     state: &Rc<RefCell<EditorState>>,
 ) {
+    if !selected_model_is_ready(form, overlay) {
+        return;
+    }
     let dialog = adw::AlertDialog::new(
         Some("New Profile"),
         Some("Save the current settings as a new profile."),
@@ -791,7 +850,8 @@ fn refresh_profiles(form: &Rc<Form>, state: &Rc<RefCell<EditorState>>) {
 
 fn refresh_models(form: &Form, cfg: &Config) {
     let current = cfg.model.path.clone();
-    let mut paths = BTreeSet::new();
+    let models_dir = default_models_dir();
+    let mut custom_paths = BTreeSet::new();
     let mut dirs = vec![default_models_dir()];
     if let Some(parent) = Path::new(&current).parent() {
         dirs.push(parent.to_path_buf());
@@ -803,47 +863,459 @@ fn refresh_models(form: &Form, cfg: &Config) {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file()
-                && path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("bin"))
-            {
-                paths.insert(path);
+            if path.is_file() && is_model_file(&path) && !is_catalog_path(&models_dir, &path) {
+                custom_paths.insert(path);
             }
         }
     }
-    if !current.is_empty() {
-        paths.insert(PathBuf::from(&current));
+    let current_path = PathBuf::from(&current);
+    if !current.is_empty() && !is_catalog_path(&models_dir, &current_path) {
+        custom_paths.insert(current_path.clone());
     }
 
     form.updating.set(true);
     let model = gtk4::StringList::new(&[]);
-    let mut list = Vec::with_capacity(paths.len());
-    if paths.is_empty() {
-        model.append("No .bin models found");
-    } else {
-        for path in &paths {
-            let label = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| path.to_string_lossy().into_owned());
-            model.append(&label);
-            list.push(path.clone());
-        }
+    let mut choices = Vec::with_capacity(MODEL_CATALOG.len() + custom_paths.len());
+    for spec in MODEL_CATALOG {
+        model.append(&catalog_label(spec, install_state(&models_dir, spec)));
+        choices.push(ModelChoice::Catalog(spec));
+    }
+    for path in custom_paths {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        let status = if path.is_file() {
+            "Custom"
+        } else {
+            "Custom, missing"
+        };
+        model.append(&format!("{name} ({status})"));
+        choices.push(ModelChoice::Custom(path));
     }
     form.model_picker.set_model(Some(&model));
-    *form.model_paths.borrow_mut() = list;
+    *form.model_choices.borrow_mut() = choices;
 
     let selected = form
-        .model_paths
+        .model_choices
         .borrow()
         .iter()
-        .position(|path| path.to_string_lossy().as_ref() == current)
+        .position(|choice| {
+            choice
+                .path()
+                .is_some_and(|path| path.to_string_lossy().as_ref() == current)
+        })
         .map_or(gtk4::INVALID_LIST_POSITION, |index| index as u32);
     form.model_picker.set_selected(selected);
     form.updating.set(false);
+    update_model_manager(form);
+}
+
+fn is_model_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("bin") || extension.eq_ignore_ascii_case("gguf")
+        })
+}
+
+fn is_catalog_path(models_dir: &Path, path: &Path) -> bool {
+    path.parent() == Some(models_dir)
+        && path
+            .file_name()
+            .and_then(|filename| filename.to_str())
+            .and_then(model_for_filename)
+            .is_some()
+}
+
+fn catalog_label(spec: &ModelSpec, install: InstallState) -> String {
+    let recommendation = if spec.recommended {
+        "Recommended, "
+    } else {
+        ""
+    };
+    let status = match install {
+        InstallState::Installed => "Installed",
+        InstallState::Missing => "Download",
+        InstallState::Invalid => "Invalid file",
+    };
+    format!(
+        "{} ({}{} - {})",
+        spec.name,
+        recommendation,
+        status,
+        format_size(spec.size_bytes)
+    )
+}
+
+fn selected_model_choice(form: &Form) -> Option<ModelChoice> {
+    let selected = form.model_picker.selected();
+    if selected == gtk4::INVALID_LIST_POSITION {
+        return None;
+    }
+    form.model_choices.borrow().get(selected as usize).cloned()
+}
+
+fn selected_model_is_ready(form: &Form, overlay: &adw::ToastOverlay) -> bool {
+    if form.model_busy.get() {
+        toast_error(
+            overlay,
+            "Wait for the model download to finish or cancel it first.",
+        );
+        return false;
+    }
+    match selected_model_choice(form) {
+        Some(ModelChoice::Catalog(spec)) => match install_state(&default_models_dir(), spec) {
+            InstallState::Installed => true,
+            InstallState::Missing => {
+                toast_error(
+                    overlay,
+                    "Download the selected model before saving this profile.",
+                );
+                false
+            }
+            InstallState::Invalid => {
+                toast_error(
+                    overlay,
+                    "Delete the invalid model file, then download it again before saving.",
+                );
+                false
+            }
+        },
+        Some(ModelChoice::Custom(path)) if path.is_file() => true,
+        Some(ModelChoice::Custom(_)) => {
+            toast_error(overlay, "The selected custom model file no longer exists.");
+            false
+        }
+        None => {
+            toast_error(
+                overlay,
+                "Select an installed model before saving this profile.",
+            );
+            false
+        }
+    }
+}
+
+fn update_model_manager(form: &Form) {
+    if form.model_busy.get() {
+        return;
+    }
+
+    form.model_progress.set_opacity(0.0);
+    form.model_progress.set_text(None);
+    match selected_model_choice(form) {
+        Some(ModelChoice::Catalog(spec)) => {
+            let install = install_state(&default_models_dir(), spec);
+            let status = match install {
+                InstallState::Installed => "Installed",
+                InstallState::Missing => "Download required",
+                InstallState::Invalid => "Invalid file - delete before downloading",
+            };
+            form.model_picker.set_subtitle(&format!(
+                "{} | {} | {} | {}",
+                spec.family,
+                spec.languages,
+                format_size(spec.size_bytes),
+                status
+            ));
+            form.model_picker.set_tooltip_text(Some(&format!(
+                "{} {} License: {}.",
+                spec.description,
+                if spec.streaming {
+                    "Streaming-capable architecture."
+                } else {
+                    "Utterance transcription."
+                },
+                spec.license
+            )));
+            form.model_action_button.set_visible(true);
+            form.model_action_button.set_sensitive(true);
+            if install != InstallState::Missing {
+                form.model_action_button
+                    .set_icon_name("user-trash-symbolic");
+                form.model_action_button
+                    .set_tooltip_text(Some("Delete selected model"));
+                form.model_action_button.add_css_class("destructive-action");
+            } else {
+                form.model_action_button
+                    .set_icon_name("folder-download-symbolic");
+                form.model_action_button
+                    .set_tooltip_text(Some("Download selected model"));
+                form.model_action_button
+                    .remove_css_class("destructive-action");
+            }
+        }
+        Some(ModelChoice::Custom(path)) => {
+            let status = if path.is_file() {
+                "Installed"
+            } else {
+                "Missing"
+            };
+            form.model_picker
+                .set_subtitle(&format!("Custom local model | {status}"));
+            form.model_picker
+                .set_tooltip_text(Some(path.display().to_string().as_str()));
+            form.model_action_button.set_visible(false);
+        }
+        None => {
+            form.model_picker
+                .set_subtitle("Select an installed model or one to download");
+            form.model_picker.set_tooltip_text(None);
+            form.model_action_button.set_visible(false);
+        }
+    }
+}
+
+fn manage_selected_model(
+    window: &adw::ApplicationWindow,
+    overlay: &adw::ToastOverlay,
+    form: &Rc<Form>,
+    state: &Rc<RefCell<EditorState>>,
+) {
+    let Some(ModelChoice::Catalog(spec)) = selected_model_choice(form) else {
+        return;
+    };
+    if form.model_busy.get() {
+        if let Some(cancel) = form.model_cancel.borrow().as_ref() {
+            cancel.store(true, Ordering::Release);
+            form.model_action_button.set_sensitive(false);
+            form.model_progress.set_text(Some("Cancelling"));
+        }
+        return;
+    }
+    match install_state(&default_models_dir(), spec) {
+        InstallState::Installed | InstallState::Invalid => {
+            confirm_delete_model(window, overlay, form, state, spec)
+        }
+        InstallState::Missing => start_model_download(window, overlay, form, state, spec),
+    }
+}
+
+fn start_model_download(
+    window: &adw::ApplicationWindow,
+    overlay: &adw::ToastOverlay,
+    form: &Rc<Form>,
+    state: &Rc<RefCell<EditorState>>,
+    spec: &'static ModelSpec,
+) {
+    if form.model_busy.replace(true) {
+        return;
+    }
+
+    form.model_picker.set_activatable(false);
+    form.profiles.set_sensitive(false);
+    window.set_deletable(false);
+    form.model_picker
+        .set_subtitle(&format!("Downloading {}", spec.name));
+    form.model_action_button
+        .set_icon_name("process-stop-symbolic");
+    form.model_action_button
+        .set_tooltip_text(Some("Cancel model download"));
+    form.model_action_button
+        .remove_css_class("destructive-action");
+    form.model_action_button.set_sensitive(true);
+    form.model_action_button.set_visible(true);
+    form.model_progress.set_fraction(0.0);
+    form.model_progress.set_text(Some("Starting"));
+    form.model_progress.set_opacity(1.0);
+
+    let (sender, receiver) = mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    *form.model_cancel.borrow_mut() = Some(Arc::clone(&cancel));
+    let models_dir = default_models_dir();
+    let worker = thread::Builder::new()
+        .name(format!("sttd-model-{}", spec.id))
+        .spawn(move || {
+            let progress_sender = sender.clone();
+            let result = download_model(&models_dir, spec, &cancel, move |downloaded, total| {
+                let _ = progress_sender.send(DownloadEvent::Progress { downloaded, total });
+            })
+            .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(DownloadEvent::Finished(result));
+        });
+
+    if let Err(error) = worker {
+        form.model_busy.set(false);
+        form.model_cancel.borrow_mut().take();
+        form.model_picker.set_activatable(true);
+        form.profiles.set_sensitive(true);
+        window.set_deletable(true);
+        update_model_manager(form);
+        toast_error(overlay, &format!("Could not start model download: {error}"));
+        return;
+    }
+
+    let overlay = overlay.clone();
+    let window = window.clone();
+    let form = Rc::clone(form);
+    let state = Rc::clone(state);
+    glib::timeout_add_local(Duration::from_millis(100), move || loop {
+        match receiver.try_recv() {
+            Ok(DownloadEvent::Progress { downloaded, total }) => {
+                let fraction = if total == 0 {
+                    0.0
+                } else {
+                    downloaded.min(total) as f64 / total as f64
+                };
+                form.model_progress.set_fraction(fraction);
+                form.model_progress
+                    .set_text(Some(&format!("{:.0}%", fraction * 100.0)));
+            }
+            Ok(DownloadEvent::Finished(result)) => {
+                form.model_busy.set(false);
+                let was_cancelled = form
+                    .model_cancel
+                    .borrow_mut()
+                    .take()
+                    .is_some_and(|cancel| cancel.load(Ordering::Acquire));
+                form.model_picker.set_activatable(true);
+                form.profiles.set_sensitive(true);
+                window.set_deletable(true);
+                match result {
+                    Ok(path) => {
+                        form.model_path.set_text(path.to_string_lossy().as_ref());
+                        form.language.set_text(spec.default_language);
+                        let mut cfg = state.borrow().config.clone();
+                        cfg.model.path = path.to_string_lossy().into_owned();
+                        refresh_models(&form, &cfg);
+                        toast(&overlay, &format!("Installed {}.", spec.name));
+                    }
+                    Err(error) => {
+                        update_model_manager(&form);
+                        if was_cancelled {
+                            toast(&overlay, "Model download cancelled.");
+                        } else {
+                            toast_error(&overlay, &format!("Model download failed: {error}"));
+                        }
+                    }
+                }
+                return glib::ControlFlow::Break;
+            }
+            Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                form.model_busy.set(false);
+                form.model_cancel.borrow_mut().take();
+                form.model_picker.set_activatable(true);
+                form.profiles.set_sensitive(true);
+                window.set_deletable(true);
+                update_model_manager(&form);
+                toast_error(&overlay, "Model download stopped unexpectedly.");
+                return glib::ControlFlow::Break;
+            }
+        }
+    });
+}
+
+fn confirm_delete_model(
+    window: &adw::ApplicationWindow,
+    overlay: &adw::ToastOverlay,
+    form: &Rc<Form>,
+    state: &Rc<RefCell<EditorState>>,
+    spec: &'static ModelSpec,
+) {
+    let models_dir = default_models_dir();
+    let Some(target) = managed_model_path(&models_dir, spec) else {
+        toast_error(
+            overlay,
+            "The selected model has an invalid managed filename.",
+        );
+        return;
+    };
+    match profiles_using_model(state, &target) {
+        Ok(profiles) if !profiles.is_empty() => {
+            toast_error(
+                overlay,
+                &format!(
+                    "{} is used by: {}. Select another installed model in those profiles and save before deleting.",
+                    spec.name,
+                    profiles.join(", ")
+                ),
+            );
+            return;
+        }
+        Err(error) => {
+            toast_error(
+                overlay,
+                &format!("Could not check model usage before deletion: {error:#}"),
+            );
+            return;
+        }
+        Ok(_) => {}
+    }
+
+    let dialog = adw::AlertDialog::new(
+        Some(&format!("Delete {}?", spec.name)),
+        Some("The verified model file will be removed from the app's model directory."),
+    );
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("delete", "Delete");
+    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+
+    let form = Rc::clone(form);
+    let state = Rc::clone(state);
+    let overlay = overlay.clone();
+    let target = target.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response != "delete" || form.model_busy.get() {
+            return;
+        }
+        let models_dir = default_models_dir();
+        match delete_managed_model(&models_dir, &target) {
+            Ok(()) => {
+                let current = PathBuf::from(form.model_path.text().as_str());
+                if current == target {
+                    let saved = PathBuf::from(&state.borrow().config.model.path);
+                    let fallback = if saved != target && saved.is_file() {
+                        Some(saved)
+                    } else {
+                        MODEL_CATALOG.iter().find_map(|candidate| {
+                            let path = managed_model_path(&models_dir, candidate)?;
+                            (path != target
+                                && install_state(&models_dir, candidate) == InstallState::Installed)
+                                .then_some(path)
+                        })
+                    };
+                    if let Some(path) = fallback {
+                        form.model_path.set_text(path.to_string_lossy().as_ref());
+                        if let Some(candidate) = MODEL_CATALOG.iter().find(|candidate| {
+                            managed_model_path(&models_dir, candidate).as_ref() == Some(&path)
+                        }) {
+                            form.language.set_text(candidate.default_language);
+                        }
+                    } else {
+                        form.model_path.set_text("");
+                    }
+                }
+                let mut cfg = state.borrow().config.clone();
+                cfg.model.path = form.model_path.text().to_string();
+                refresh_models(&form, &cfg);
+                toast(&overlay, &format!("Deleted {}.", spec.name));
+            }
+            Err(error) => toast_error(
+                &overlay,
+                &format!("Could not delete {}: {error:#}", spec.name),
+            ),
+        }
+    });
+    dialog.present(Some(window));
+}
+
+fn profiles_using_model(state: &Rc<RefCell<EditorState>>, target: &Path) -> Result<Vec<String>> {
+    let store = state.borrow().store.clone();
+    let mut profiles = Vec::new();
+    for name in store.list().context("listing profiles")? {
+        let cfg = store
+            .load(&name)
+            .with_context(|| format!("loading profile '{name}'"))?;
+        if cfg.model.model_path() == target {
+            profiles.push(name);
+        }
+    }
+    Ok(profiles)
 }
 
 fn collect_config(state: &Rc<RefCell<EditorState>>, form: &Form) -> Config {

@@ -68,6 +68,18 @@ pub const VALID_FRAME_MS: &[u32] = &[10, 20, 30];
 /// Default VAD frame duration (ms).
 pub const DEFAULT_FRAME_MS: u32 = 10;
 
+/// Minimum per-frame signal level before WebRTC VAD is allowed to classify a
+/// frame as speech. The physical microphone on this host sits around 0.008
+/// RMS while idle (with occasional isolated frames near 0.015); keeping this
+/// above that floor while allowing a little headroom preserves normal speech
+/// at a comfortable distance.
+const MIN_SPEECH_RMS: f32 = 0.012;
+
+/// Require a short run of qualifying frames before opening an utterance. This
+/// filters isolated keyboard/click transients that WebRTC VAD can otherwise
+/// expand into a long hangover chunk.
+const SPEECH_CONFIRM_FRAMES: usize = 8;
+
 /// Samples for a given frame duration at 16 kHz.
 #[inline]
 pub fn frame_samples(frame_ms: u32) -> Result<usize> {
@@ -171,6 +183,10 @@ impl VadBackend {
     }
 
     fn is_speech(&mut self, frame: &[f32]) -> bool {
+        let rms = frame_rms(frame);
+        if rms < MIN_SPEECH_RMS {
+            return false;
+        }
         if self.i16_buf.len() != frame.len() {
             self.i16_buf.resize(frame.len(), 0);
         }
@@ -205,7 +221,9 @@ struct VadBackend {
 #[cfg(not(feature = "stt-engine"))]
 impl VadBackend {
     fn new(_frame_len: usize) -> Self {
-        Self { threshold: 0.01 }
+        Self {
+            threshold: MIN_SPEECH_RMS,
+        }
     }
 
     fn is_speech(&mut self, frame: &[f32]) -> bool {
@@ -221,6 +239,15 @@ impl VadBackend {
     }
 
     fn reset(&mut self) {}
+}
+
+#[inline]
+fn frame_rms(frame: &[f32]) -> f32 {
+    if frame.is_empty() {
+        return 0.0;
+    }
+    let sum = frame.iter().map(|sample| sample * sample).sum::<f32>();
+    (sum / frame.len() as f32).sqrt()
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +295,9 @@ pub struct Chunker {
     /// path) are also copied into `session`.
     accumulate_session: bool,
     session: Vec<f32>,
+    /// Candidate speech held until enough consecutive frames confirm it.
+    speech_candidate: Vec<f32>,
+    speech_candidate_frames: usize,
 }
 
 impl Chunker {
@@ -325,6 +355,8 @@ impl Chunker {
             speech_pending,
             accumulate_session: false,
             session: Vec::new(),
+            speech_candidate: Vec::with_capacity(frame_len * SPEECH_CONFIRM_FRAMES),
+            speech_candidate_frames: 0,
         })
     }
 
@@ -448,6 +480,8 @@ impl Chunker {
         self.partial.clear();
         self.current.clear();
         self.session.clear();
+        self.speech_candidate.clear();
+        self.speech_candidate_frames = 0;
         self.silence_samples = 0;
         self.in_speech = false;
         self.speech_pending.set(false);
@@ -458,7 +492,29 @@ impl Chunker {
 
     fn process_frame(&mut self, frame: &[f32]) -> Option<Vec<f32>> {
         let speech = self.backend.is_speech(frame);
-        self.apply_frame(frame, speech)
+        if self.in_speech {
+            return self.apply_frame(frame, speech);
+        }
+
+        if !speech {
+            self.speech_candidate.clear();
+            self.speech_candidate_frames = 0;
+            return None;
+        }
+
+        self.speech_candidate.extend_from_slice(frame);
+        self.speech_candidate_frames += 1;
+        if self.speech_candidate_frames < SPEECH_CONFIRM_FRAMES {
+            return None;
+        }
+
+        let candidate = std::mem::take(&mut self.speech_candidate);
+        self.speech_candidate_frames = 0;
+        let mut last_closed = None;
+        for confirmed_frame in candidate.chunks(self.frame_len) {
+            last_closed = self.apply_frame(confirmed_frame, true);
+        }
+        last_closed
     }
 
     /// Apply one complete frame with an explicit speech decision.
@@ -505,6 +561,8 @@ impl Chunker {
     }
 
     fn close_current(&mut self) -> Option<Vec<f32>> {
+        self.speech_candidate.clear();
+        self.speech_candidate_frames = 0;
         if self.current.is_empty() {
             self.in_speech = false;
             self.speech_pending.set(false);
@@ -705,6 +763,13 @@ mod tests {
         c.push_samples(&silence(FRAME_SAMPLES_10MS * 5));
         assert!(c.flush().is_none());
         assert!(!c.speech_pending().get());
+    }
+
+    #[test]
+    fn energy_gate_rejects_idle_level_noise() {
+        let mut backend = VadBackend::new(FRAME_SAMPLES_10MS);
+        let idle_noise = vec![0.01; FRAME_SAMPLES_10MS];
+        assert!(!backend.is_speech(&idle_noise));
     }
 
     #[test]

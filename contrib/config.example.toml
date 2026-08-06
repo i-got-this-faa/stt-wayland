@@ -38,3 +38,8 @@ margin = 16
 enabled = true
 # Delay between characters (ms); 0 = batch as fast as protocol allows.
 char_delay_ms = 0
+
+[tray]
+# StatusNotifierItem tray icon. Needs a session D-Bus bus.
+# No tray host or no session bus: the icon is silently absent.
+enabled = true

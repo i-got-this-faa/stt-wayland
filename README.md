@@ -4,8 +4,9 @@ Local, privacy-preserving **Wayland speech-to-text daemon** for Linux desktops (
 
 | Component | Role |
 |-----------|------|
-| **sttd** | Session daemon: PipeWire capture → webrtc-vad → whisper.cpp → overlay + virtual-keyboard inject |
+| **sttd** | Session daemon: PipeWire capture → webrtc-vad → whisper.cpp → overlay + tray + virtual-keyboard inject |
 | **sttctl** | CLI control client (`start` / `stop` / `toggle` / …) |
+| **stt-settings** | GTK4/libadwaita profile editor for models and daemon configuration |
 | **proto** | Shared newline-delimited JSON IPC types |
 
 **No cloud STT.** Models are on-device (`base.en` / `small.en` via [whisper-rs](https://crates.io/crates/whisper-rs) / whisper.cpp). Native Wayland only (no X11 injection helpers, no Wine).
@@ -28,6 +29,7 @@ Local, privacy-preserving **Wayland speech-to-text daemon** for Linux desktops (
 - **Modes**: `Live` (commit+inject per VAD chunk) | `Edit` (buffer → EditReview pane).
 - **Overlay**: `gtk4` + `gtk4-layer-shell`, `Layer::Overlay`. Keyboard interactivity `None` while recording; `OnDemand` only in EditReview.
 - **Inject**: `virtual-keyboard-unstable-v1` via `wayland-client` (not wtype/ydotool). Missing protocol → clear status error.
+- **Tray**: StatusNotifierItem over the session D-Bus. The bundled icon reflects Idle, Recording, Paused, and Error; click toggles capture and the menu also exposes Quit.
 
 ### State machine
 
@@ -49,7 +51,7 @@ EditReview --Discard--> Idle
 ```bash
 sudo pacman -S --needed base-devel rust cmake clang pkgconf \
   pipewire pipewire-pulse libpipewire \
-  gtk4 gtk4-layer-shell wayland wayland-protocols
+  gtk4 gtk4-layer-shell libadwaita wayland wayland-protocols
 ```
 
 ### Debian / Ubuntu
@@ -57,7 +59,7 @@ sudo pacman -S --needed base-devel rust cmake clang pkgconf \
 ```bash
 sudo apt install build-essential pkg-config cmake clang \
   libpipewire-0.3-dev libspa-0.2-dev \
-  libgtk-4-dev libgtk4-layer-shell-dev \
+  libgtk-4-dev libgtk4-layer-shell-dev libadwaita-1-dev \
   libwayland-dev wayland-protocols
 ```
 
@@ -65,7 +67,7 @@ sudo apt install build-essential pkg-config cmake clang \
 
 ```bash
 sudo dnf install gcc gcc-c++ cmake clang pkgconf-pkg-config \
-  pipewire-devel gtk4-devel gtk4-layer-shell-devel \
+  pipewire-devel gtk4-devel gtk4-layer-shell-devel libadwaita-devel \
   wayland-devel wayland-protocols-devel
 ```
 
@@ -76,7 +78,7 @@ sudo dnf install gcc gcc-c++ cmake clang pkgconf-pkg-config \
 | `pipewire` | Audio capture | **0.9** (0.8 breaks on PipeWire ≥1.4) |
 | `webrtc-vad` | Voice activity detection | 0.4 |
 | `whisper-rs` | whisper.cpp bindings (needs **cmake** + **clang/libclang**) | **0.16** |
-| `gtk4`, `gtk4-layer-shell` | Overlay UI | 0.9 / 0.4 |
+| `gtk4`, `gtk4-layer-shell`, `libadwaita` | Overlay + settings UI | 0.9 / 0.4 / 0.9 |
 | `wayland-client`, `wayland-protocols-misc` | virtual-keyboard inject | 0.31 / 0.3 |
 
 `whisper-rs` compiles whisper.cpp from source on first build; expect several minutes and a C/C++ toolchain.
@@ -89,6 +91,8 @@ sudo dnf install gcc gcc-c++ cmake clang pkgconf-pkg-config \
 | `stt-engine` | yes | whisper-rs + webrtc-vad |
 | `overlay` | yes | gtk4 + layer-shell |
 | `inject` | yes | wayland virtual-keyboard |
+| `tray` | yes | StatusNotifierItem over D-Bus |
+| `settings` | yes | GTK4 settings application |
 
 Check without system GUI/audio libs:
 
@@ -103,7 +107,7 @@ Full daemon (default):
 cargo build --release
 ```
 
-Binaries: `target/release/sttd`, `target/release/sttctl`.
+Binaries: `target/release/sttd`, `target/release/sttctl`, `target/release/stt-settings`.
 
 ## Model setup
 
@@ -134,6 +138,23 @@ See [`contrib/config.example.toml`](contrib/config.example.toml). Sections:
 - `[model]` — path/name, directory, `residency = "preload" | "lazy"`
 - `[overlay]` — preview crossfade (~200 ms), edit buffer cap
 - `[injection]` — enable virtual-keyboard inject
+- `[tray]` — enable the StatusNotifierItem icon (defaults to on)
+
+### Profiles and settings GUI
+
+Launch `stt-settings` to manage named profiles under
+`~/.config/sttd/profiles/`. It discovers local `.bin` Whisper models and edits
+the model, audio/VAD, overlay, injection, and tray settings. **Save** updates
+only the selected profile; **Apply** also mirrors it to
+`~/.config/sttd/config.toml` for the existing systemd unit. Restart `sttd` after
+applying a profile. Use the refresh button next to the model list after adding
+a model while the editor is open.
+
+The daemon can also use a profile directly without changing the active config:
+
+```bash
+sttd --profile Work
+```
 
 Optional first-run:
 
@@ -181,6 +202,16 @@ sttctl status
 Socket: `$XDG_RUNTIME_DIR/sttd.sock`.
 
 Idle behaviour: no PipeWire stream and no mapped overlay surface (GTK runtime stays warm on its thread).
+
+Settings GUI: `stt-settings` is a separate GTK4/libadwaita application and does
+not need the daemon to be running. Profile changes are persisted atomically;
+switching profiles affects the next daemon start/restart.
+
+Tray behaviour: when enabled, `sttd` registers a StatusNotifierItem on the
+session D-Bus. The icon shows idle, recording, paused, or error state; a
+left-click toggles capture, and the menu contains the current state/model,
+Start/Stop, and Quit. A missing session bus or tray host is a silent no-op, so
+the daemon remains usable on headless sessions.
 
 ### systemd user unit
 
@@ -246,6 +277,7 @@ stt-wayland/
   sttd/               # daemon
     src/
       main.rs         # socket server + core event loop + pipeline wiring
+      settings.rs     # GTK4 profile/model settings application
       audio.rs        # PipeWire stream
       vad.rs          # webrtc-vad chunker
       stt.rs          # whisper-rs worker thread

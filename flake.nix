@@ -36,14 +36,18 @@
             nativeBuildInputs = with pkgs; [
               pkg-config cmake clang
               autoPatchelfHook
+              wrapGAppsHook4
             ];
             buildInputs = with pkgs; [
               pipewire
               gtk4
               gtk4-layer-shell
+              libadwaita
               wayland
               wayland-protocols
               libclang.lib
+              gsettings-desktop-schemas
+              hicolor-icon-theme
             ];
             LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
           };
@@ -61,7 +65,7 @@
             packages = with pkgs; [
               rust
               pkg-config cmake clang
-              pipewire gtk4 gtk4-layer-shell wayland wayland-protocols
+              pipewire gtk4 gtk4-layer-shell libadwaita wayland wayland-protocols
               libclang.lib
               stdenv.cc.cc.lib
             ];
@@ -75,6 +79,10 @@
         default = {
           type = "app";
           program = "${self.packages.${system}.default}/bin/sttd";
+        };
+        settings = {
+          type = "app";
+          program = "${self.packages.${system}.default}/bin/stt-settings";
         };
       });
     };

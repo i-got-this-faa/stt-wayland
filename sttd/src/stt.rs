@@ -1,4 +1,4 @@
-//! Speech-to-text engine (transcribe-cpp over transcribe.cpp).
+//! Speech-to-text engine (audio-cpp over audio.cpp).
 //!
 //! # Architecture
 //!
@@ -15,17 +15,16 @@
 //!
 //! # Models
 //!
-//! transcribe.cpp GGUF models and legacy whisper.cpp GGML `.bin` models under
-//! `~/.local/share/sttd/models/`. Residency: `preload` (default) or `lazy`.
+//! audio.cpp GGUF ASR models (Qwen3 ASR, Parakeet TDT, Nemotron ASR, Citrinet)
+//! under `~/.local/share/sttd/models/`, managed by `stt-settings` via the model
+//! catalog. Residency: `preload` (default) or `lazy`.
 //!
 //! # Feature flag
 //!
-//! Real inference requires the `stt-engine` feature (links `transcribe-cpp`).
+//! Real inference requires the `stt-engine` feature (links `audio-cpp`).
 //! Without it the worker still starts and the API is complete, but
 //! load/transcribe return clear errors. Build with CMake and a C++ toolchain.
 
-use std::fs;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{
@@ -39,11 +38,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{ModelConfig, ModelResidency};
-
-// transcribe-cpp-sys 0.1.3 omits its Linux CBLAS dependency from the link manifest.
-#[cfg(all(feature = "stt-engine", target_os = "linux"))]
-#[link(name = "cblas")]
-extern "C" {}
 
 /// Speech engine + webrtc-vad capture rate (mono f32).
 pub const SAMPLE_RATE_HZ: u32 = 16_000;
@@ -523,12 +517,15 @@ struct SttWorker {
     session_id: u64,
     /// Tail of the last Live chunk, prepended to the next for continuity.
     overlap_tail: Vec<f32>,
-    /// Last committed Live text (Whisper initial prompt when supported).
-    last_prompt: String,
+    /// Engine handles. Dropping order matters: the session borrows the model in
+    /// the C ABI, and the model borrows the registry. Fields drop in
+    /// declaration order, so `session` is declared first.
     #[cfg(feature = "stt-engine")]
-    session: Option<transcribe_cpp::Session>,
+    session: Option<audio_cpp::Session>,
     #[cfg(feature = "stt-engine")]
-    model_arch: Option<String>,
+    model: Option<audio_cpp::Model>,
+    #[cfg(feature = "stt-engine")]
+    registry: Option<audio_cpp::Registry>,
 }
 
 impl SttWorker {
@@ -537,17 +534,17 @@ impl SttWorker {
             cfg,
             session_id: 0,
             overlap_tail: Vec::new(),
-            last_prompt: String::new(),
             #[cfg(feature = "stt-engine")]
             session: None,
             #[cfg(feature = "stt-engine")]
-            model_arch: None,
+            model: None,
+            #[cfg(feature = "stt-engine")]
+            registry: None,
         }
     }
 
     fn clear_session(&mut self) {
         self.overlap_tail.clear();
-        self.last_prompt.clear();
         debug!("stt worker: session reset");
     }
 
@@ -560,7 +557,8 @@ impl SttWorker {
         #[cfg(feature = "stt-engine")]
         {
             self.session = None;
-            self.model_arch = None;
+            self.model = None;
+            self.registry = None;
         }
         self.cfg.loaded.store(false, Ordering::Release);
         self.clear_session();
@@ -574,73 +572,68 @@ impl SttWorker {
     }
 
     fn load_model(&mut self) -> Result<()> {
-        let path = &self.cfg.model_path;
+        let path = self.cfg.model_path.clone();
 
         if !path.exists() {
-            match download_model(path) {
-                Ok(true) => {
-                    // Downloaded successfully — fall through to load.
-                }
-                Ok(false) => {
-                    bail!(
-                        "transcription model not found at {} — install a supported GGUF or \
-                         legacy whisper.cpp .bin model under ~/.local/share/sttd/models/",
-                        path.display()
-                    );
-                }
-                Err(e) => {
-                    bail!(
-                        "transcription model not found at {} and legacy Whisper \
-                         auto-download failed: {e:#} — install a supported GGUF or \
-                         whisper.cpp .bin model under ~/.local/share/sttd/models/",
-                        path.display()
-                    );
-                }
-            }
+            bail!(
+                "transcription model not found at {} — install a supported \
+                 audio.cpp GGUF under ~/.local/share/sttd/models/ via stt-settings",
+                path.display()
+            );
         }
 
         #[cfg(feature = "stt-engine")]
         {
             info!(path = %path.display(), "stt worker: loading transcription model");
 
-            disable_engine_logging_once();
+            let registry = audio_cpp::Registry::new()
+                .map_err(|e| anyhow!("failed to create audio.cpp registry: {e}"))?;
 
-            let model = transcribe_cpp::Model::load(path).map_err(|e| {
+            // GGUF weights cannot be auto-detected by audio.cpp; the family
+            // must be derived from the managed filename.
+            let filename = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            let family = model_family_for_filename(filename).ok_or_else(|| {
                 anyhow!(
-                    "failed to load transcription model at {}: {e}",
+                    "cannot determine audio.cpp model family for {} — unsupported \
+                     filename; supported prefixes: qwen3-asr, parakeet, nemotron, \
+                     citrinet, hviske, fun-asr-nano",
                     path.display()
                 )
             })?;
-            let arch = model.arch();
-            let variant = model.variant();
-            let backend = model.backend();
-            let capabilities = model.capabilities();
-            if capabilities.native_sample_rate != SAMPLE_RATE_HZ as i32 {
-                bail!(
-                    "model at {} requires {} Hz audio; sttd currently supplies {} Hz",
-                    path.display(),
-                    capabilities.native_sample_rate,
-                    SAMPLE_RATE_HZ
-                );
-            }
+
+            let family_name = family.as_str().to_owned();
+            let model = registry
+                .load(&path.to_string_lossy(), Some(family), None)
+                .map_err(|e| {
+                    anyhow!(
+                        "failed to load transcription model at {}: {e}",
+                        path.display()
+                    )
+                })?;
 
             let session = model
-                .session_with(&transcribe_cpp::SessionOptions {
-                    n_threads: self.cfg.threads,
-                    ..Default::default()
-                })
+                .create_task_session(
+                    audio_cpp::TaskKind::Asr,
+                    audio_cpp::RunMode::Offline,
+                    audio_cpp::Backend::Cpu,
+                    0, // device
+                    self.cfg.threads,
+                    None,
+                )
                 .map_err(|e| anyhow!("failed to create transcription session: {e}"))?;
 
             info!(
                 path = %path.display(),
-                arch = %arch,
-                variant = %variant,
-                backend = %backend,
-                supports_streaming = capabilities.supports_streaming,
+                family = %family_name,
+                threads = self.cfg.threads,
                 "stt worker: model ready"
             );
 
-            self.model_arch = Some(arch);
+            self.registry = Some(registry);
+            self.model = Some(model);
             self.session = Some(session);
             self.cfg.loaded.store(true, Ordering::Release);
             Ok(())
@@ -650,7 +643,7 @@ impl SttWorker {
         {
             let _ = path;
             bail!(
-                "sttd built without `stt-engine` feature (transcribe-cpp not linked); \
+                "sttd built without `stt-engine` feature (audio-cpp not linked); \
                  rebuild with default features and a CMake/C++ toolchain"
             );
         }
@@ -672,14 +665,13 @@ impl SttWorker {
         pcm.extend_from_slice(&self.overlap_tail);
         pcm.extend_from_slice(&samples);
 
-        let use_prompt = is_final && !self.last_prompt.is_empty();
-        let text = self.run_transcription(&pcm, use_prompt)?;
+        let text = self.run_transcription(&pcm)?;
 
         if is_final {
             // Keep only the tail of the committed chunk. Preview jobs are
             // snapshots of the current utterance; updating the overlap from
             // them would duplicate the preview tail in the eventual final
-            // chunk and make repeated previews affect decoder continuity.
+            // chunk.
             let n = self.cfg.overlap_samples.min(samples.len());
             if n > 0 {
                 self.overlap_tail = samples[samples.len() - n..].to_vec();
@@ -687,10 +679,6 @@ impl SttWorker {
                 self.overlap_tail.clear();
             }
 
-            if !text.is_empty() {
-                // Prefer last ~200 chars as prompt context for the next chunk.
-                self.last_prompt = truncate_prompt(&text, 200);
-            }
             debug!(
                 n_samples = samples.len(),
                 n_with_overlap = pcm.len(),
@@ -723,12 +711,7 @@ impl SttWorker {
         }
 
         self.ensure_loaded()?;
-        let text = self.run_transcription(&samples, false)?;
-        info!(
-            n_samples = samples.len(),
-            chars = text.len(),
-            "stt worker: edit full buffer"
-        );
+        let text = self.run_transcription(&samples)?;
         Ok(TranscriptResult {
             text,
             is_final: true,
@@ -737,59 +720,35 @@ impl SttWorker {
     }
 
     #[cfg(feature = "stt-engine")]
-    fn run_transcription(&mut self, pcm: &[f32], use_prompt: bool) -> Result<String> {
-        let language = self.cfg.language.trim();
-        let mut options = transcribe_cpp::RunOptions {
-            timestamps: transcribe_cpp::TimestampKind::None,
-            language: (!language.is_empty() && language != "auto").then(|| language.to_string()),
-            ..Default::default()
-        };
-
-        // Prompt continuity and no-speech thresholds are Whisper-specific.
-        // Other model families use their own shipped decoding defaults.
-        if self.model_arch.as_deref() == Some("whisper") {
-            options.family = Some(transcribe_cpp::RunExtension::Whisper(
-                transcribe_cpp::WhisperRunOptions {
-                    initial_prompt: use_prompt.then(|| self.last_prompt.clone()),
-                    condition_on_prev_tokens: Some(use_prompt),
-                    temperature: Some(0.0),
-                    temperature_inc: Some(0.0),
-                    no_speech_thold: Some(MAX_NO_SPEECH_PROBABILITY),
-                    ..Default::default()
-                },
-            ));
-        }
-
+    fn run_transcription(&mut self, pcm: &[f32]) -> Result<String> {
         let session = self
             .session
             .as_mut()
             .ok_or_else(|| anyhow!("transcription session missing after load"))?;
-        let limits = session
-            .limits()
-            .map_err(|e| anyhow!("reading transcription session limits failed: {e}"))?;
-        if limits.effective_max_audio_ms > 0 {
-            let max_samples = (limits.effective_max_audio_ms as u64)
-                .saturating_mul(u64::from(SAMPLE_RATE_HZ))
-                / 1000;
-            if pcm.len() as u64 > max_samples {
-                bail!(
-                    "audio buffer is too long for this model ({} ms > {} ms)",
-                    pcm.len() as u64 * 1000 / u64::from(SAMPLE_RATE_HZ),
-                    limits.effective_max_audio_ms
-                );
-            }
-        }
-        let transcript = session
-            .run(pcm, &options)
-            .map_err(|e| anyhow!("transcription run failed: {e}"))?;
 
-        Ok(collapse_ws(&transcript.text))
+        // Inline mono 16 kHz PCM buffer — no temp WAV file round-trip.
+        let buffer = audio_cpp::WavAudio {
+            sample_rate: SAMPLE_RATE_HZ as i32,
+            channels: 1,
+            samples: pcm.to_vec(),
+        };
+        let mut request = audio_cpp::Request::asr(audio_cpp::AudioInput::Buffer(buffer));
+        let language = self.cfg.language.trim();
+        if !language.is_empty() && language != "auto" {
+            request = request.option("language", language);
+        }
+
+        let result = session
+            .run_offline(request)
+            .map_err(|e| anyhow!("transcription run failed: {e}"))?;
+        let text = result.text_output.map(|t| t.text).unwrap_or_default();
+        Ok(collapse_ws(&text))
     }
 
     #[cfg(not(feature = "stt-engine"))]
-    fn run_transcription(&mut self, _pcm: &[f32], _use_prompt: bool) -> Result<String> {
+    fn run_transcription(&mut self, _pcm: &[f32]) -> Result<String> {
         bail!(
-            "sttd built without `stt-engine` feature (transcribe-cpp not linked); \
+            "sttd built without `stt-engine` feature (audio-cpp not linked); \
              rebuild with default features"
         );
     }
@@ -810,103 +769,32 @@ fn resolve_threads(configured: u32) -> i32 {
         .unwrap_or(4)
 }
 
-fn truncate_prompt(text: &str, max_chars: usize) -> String {
-    let t = text.trim();
-    if t.chars().count() <= max_chars {
-        return t.to_string();
-    }
-    // Keep the tail (most recent speech) as decoder prompt.
-    let mut acc = String::new();
-    for ch in t.chars().rev().take(max_chars) {
-        acc.push(ch);
-    }
-    acc.chars().rev().collect()
-}
-
 fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Whisper no-speech threshold applied by the family-specific decoder.
-const MAX_NO_SPEECH_PROBABILITY: f32 = 0.6;
-
+/// Map a managed model filename to the audio.cpp model family that can load
+/// it. GGUF weights cannot be auto-detected by the engine, so the family hint
+/// is required and derived from the filename prefix assigned by the catalog.
 #[cfg(feature = "stt-engine")]
-fn disable_engine_logging_once() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(transcribe_cpp::disable_logging);
-}
-
-/// Known whisper.cpp model filenames available for auto-download.
-const KNOWN_MODELS: &[&str] = &[
-    "ggml-tiny.en.bin",
-    "ggml-base.en.bin",
-    "ggml-small.en.bin",
-    "ggml-medium.en.bin",
-];
-
-/// Hugging Face repo for whisper.cpp GGML models.
-const HF_REPO: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
-
-/// Attempt to download a whisper model from Hugging Face.
-///
-/// Returns `Ok(true)` on success, `Ok(false)` if the model filename is not in
-/// the known list (no download attempted), and `Err` on network/IO failure.
-fn download_model(path: &Path) -> Result<bool> {
-    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
-    if !KNOWN_MODELS.contains(&filename) {
-        return Ok(false);
+fn model_family_for_filename(filename: &str) -> Option<audio_cpp::ModelFamily> {
+    use audio_cpp::ModelFamily;
+    let lower = filename.to_ascii_lowercase();
+    if lower.starts_with("qwen3-asr") {
+        Some(ModelFamily::Qwen3Asr)
+    } else if lower.starts_with("parakeet") {
+        Some(ModelFamily::ParakeetTdt)
+    } else if lower.starts_with("nemotron") {
+        Some(ModelFamily::NemotronAsr)
+    } else if lower.starts_with("citrinet") {
+        Some(ModelFamily::CitrinetAsr)
+    } else if lower.starts_with("hviske") {
+        Some(ModelFamily::HviskeAsr)
+    } else if lower.starts_with("fun-asr-nano") {
+        Some(ModelFamily::FunAsrNano)
+    } else {
+        None
     }
-
-    let url = format!("{HF_REPO}/{filename}");
-    info!(%url, "downloading whisper model");
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating model directory {}", parent.display()))?;
-    }
-
-    let response = ureq::get(&url)
-        .call()
-        .with_context(|| format!("HTTP request failed for {url}"))?;
-
-    let total: u64 = response
-        .header("Content-Length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-
-    let mut reader = response.into_reader();
-    let mut file = fs::File::create(path)
-        .with_context(|| format!("creating model file {}", path.display()))?;
-    let mut buf = [0u8; 65536];
-    let mut downloaded: u64 = 0;
-    let mut last_report: u64 = 0;
-
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .with_context(|| "reading download stream")?;
-        if n == 0 {
-            break;
-        }
-        file.write_all(&buf[..n])
-            .with_context(|| "writing model file")?;
-        downloaded += n as u64;
-
-        // Report progress every ~5 MiB.
-        if downloaded - last_report >= 5_242_880 {
-            if let Some(pct) = (downloaded * 100).checked_div(total) {
-                info!(pct, downloaded, total, "model download progress");
-            } else {
-                info!(downloaded, "model download progress (unknown total)");
-            }
-            last_report = downloaded;
-        }
-    }
-
-    file.flush().with_context(|| "flushing model file")?;
-    info!(downloaded, "model downloaded");
-    Ok(true)
 }
 
 #[cfg(test)]
@@ -919,14 +807,30 @@ mod tests {
     }
 
     #[test]
-    fn truncate_prompt_keeps_tail() {
-        let s = "a".repeat(50) + "TAIL";
-        let t = truncate_prompt(&s, 4);
-        assert_eq!(t, "TAIL");
-    }
-
-    #[test]
     fn collapse_whitespace() {
         assert_eq!(collapse_ws("  hello   world  "), "hello world");
+    }
+
+    #[cfg(feature = "stt-engine")]
+    #[test]
+    fn family_mapping_covers_catalog_prefixes() {
+        use audio_cpp::ModelFamily;
+        assert_eq!(
+            model_family_for_filename("qwen3-asr-0.6b-q8_0.gguf"),
+            Some(ModelFamily::Qwen3Asr)
+        );
+        assert_eq!(
+            model_family_for_filename("parakeet-tdt-0.6b-v3-q8_0.gguf"),
+            Some(ModelFamily::ParakeetTdt)
+        );
+        assert_eq!(
+            model_family_for_filename("nemotron-3.5-asr-q8_0.gguf"),
+            Some(ModelFamily::NemotronAsr)
+        );
+        assert_eq!(
+            model_family_for_filename("citrinet-asr-q8_0.gguf"),
+            Some(ModelFamily::CitrinetAsr)
+        );
+        assert_eq!(model_family_for_filename("ggml-base.en.bin"), None);
     }
 }

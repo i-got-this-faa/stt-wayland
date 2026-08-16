@@ -4,17 +4,17 @@ Local, privacy-preserving **Wayland speech-to-text daemon** for Linux desktops (
 
 | Component | Role |
 |-----------|------|
-| **sttd** | Session daemon: PipeWire capture → webrtc-vad → transcribe.cpp → overlay + tray + virtual-keyboard inject |
+| **sttd** | Session daemon: PipeWire capture → webrtc-vad → audio.cpp → overlay + tray + virtual-keyboard inject |
 | **sttctl** | CLI control client (`start` / `stop` / `toggle` / …) |
 | **stt-settings** | GTK4/libadwaita profile editor for models and daemon configuration |
 | **proto** | Shared newline-delimited JSON IPC types |
 
-**No cloud STT.** Models run on-device through [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp), including modern GGUF ASR families and legacy whisper.cpp `.bin` files. Native Wayland only (no X11 injection helpers, no Wine).
+**No cloud STT.** Models run on-device through [audio.cpp](https://github.com/0xShug0/audio.cpp) — modern GGUF ASR families (Qwen3 ASR, Parakeet TDT, Nemotron ASR, Citrinet). Native Wayland only (no X11 injection helpers, no Wine).
 
 ## Architecture (v1)
 
 ```
-  mic (PipeWire) ──► webrtc-vad ──► mpsc<Vec<f32>> ──► transcribe.cpp
+  mic (PipeWire) ──► webrtc-vad ──► mpsc<Vec<f32>> ──► audio.cpp
                          │                                  │
                          │                          committed text
                          ▼                                  │
@@ -80,18 +80,18 @@ sudo dnf install gcc gcc-c++ cmake clang pkgconf-pkg-config \
 |-------|---------|-------------|
 | `pipewire` | Audio capture | **0.9** (0.8 breaks on PipeWire ≥1.4) |
 | `webrtc-vad` | Voice activity detection | 0.4 |
-| `transcribe-cpp` | Multi-family transcribe.cpp bindings (needs **CMake**, C++, and CBLAS on Linux) | **0.1.3** |
+| `audio-cpp` | audio.cpp bindings (needs **CMake** + C++ toolchain) | **0.2** |
 | `gtk4`, `gtk4-layer-shell`, `libadwaita` | Overlay + settings UI | 0.9 / 0.4 / 0.9 |
 | `wayland-client`, `wayland-protocols-misc` | virtual-keyboard inject | 0.31 / 0.3 |
 
-`transcribe-cpp` compiles transcribe.cpp from source on first build. The default build is CPU-only and self-contained apart from the Linux CBLAS link dependency.
+`audio-cpp` compiles audio.cpp (ggml) from source on first build. The default build is CPU-only and self-contained.
 
 ### Feature flags (`sttd`)
 
 | Feature | Default | Notes |
 |---------|---------|-------|
 | `audio` | yes | PipeWire |
-| `stt-engine` | yes | transcribe-cpp + webrtc-vad |
+| `stt-engine` | yes | audio-cpp + webrtc-vad |
 | `overlay` | yes | gtk4 + layer-shell |
 | `inject` | yes | wayland virtual-keyboard |
 | `tray` | yes | StatusNotifierItem over D-Bus |
@@ -287,7 +287,7 @@ stt-wayland/
       settings.rs     # GTK4 profile/model settings application
       audio.rs        # PipeWire stream
       vad.rs          # webrtc-vad chunker
-      stt.rs          # transcribe.cpp worker thread
+      stt.rs          # audio.cpp worker thread
       model_catalog.rs # pinned models + verified download/delete helpers
       state.rs        # state machine
       inject.rs       # virtual-keyboard

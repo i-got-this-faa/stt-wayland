@@ -151,7 +151,7 @@ impl Form {
 
         let model_path = entry_row(
             "File Path",
-            "Path to a transcribe.cpp GGUF or legacy whisper.cpp BIN model",
+            "Path to an audio.cpp GGUF model file",
         );
 
         let residency = string_combo(&RESIDENCIES);

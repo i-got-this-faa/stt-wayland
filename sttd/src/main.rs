@@ -1,6 +1,6 @@
 //! `sttd` — Wayland speech-to-text daemon.
 //!
-//! Stack: PipeWire capture -> webrtc-vad -> transcribe.cpp -> gtk4 overlay +
+//! Stack: PipeWire capture -> webrtc-vad -> audio.cpp -> gtk4 overlay +
 //! virtual-keyboard injection. Control plane: Unix socket NDJSON (`proto`).
 //!
 //! # Runtime layout
@@ -10,7 +10,7 @@
 //! | main (tokio)      | Core event loop: IPC, state machine, STT results  |
 //! | sttd-pipewire     | PipeWire stream (open on Start, close on Stop)    |
 //! | sttd-pipeline     | VAD chunking → STT command enqueue                |
-//! | sttd-transcribe   | transcribe.cpp model session                      |
+//! | sttd-transcribe   | audio.cpp model session                      |
 //! | sttd-overlay      | GTK4 + layer-shell main loop (warm when idle)     |
 //!
 //! Overlay and IPC share one state-transition path via [`CoreEvent`].
@@ -57,7 +57,7 @@ use crate::vad::{Chunker, SpeechPending, DEFAULT_FRAME_MS, SAMPLE_RATE_HZ};
 #[derive(Debug, Parser)]
 #[command(
     name = "sttd",
-    about = "Wayland speech-to-text daemon (PipeWire + transcribe.cpp)",
+    about = "Wayland speech-to-text daemon (PipeWire + audio.cpp)",
     version
 )]
 struct Cli {

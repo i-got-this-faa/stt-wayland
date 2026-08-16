@@ -111,11 +111,11 @@ pub enum ModelResidency {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelConfig {
-    /// Path to the ggml model file. Supports leading `~`.
+    /// Path to the audio.cpp GGUF model file. Supports leading `~`.
     ///
     /// Empty means “derive from [`Self::name`] + [`Self::directory`]”
     /// (legacy TOML). After [`Config::load`], always the expanded path.
-    /// Default resolved path: `~/.local/share/sttd/models/ggml-base.en.bin`.
+    /// Default resolved path: `~/.local/share/sttd/models/qwen3-asr-0.6b-q8_0.gguf`.
     pub path: String,
 
     /// `preload` (default) or `lazy`.
@@ -135,7 +135,7 @@ pub struct ModelConfig {
 }
 
 fn default_model_name() -> String {
-    "ggml-base.en.bin".into()
+    "qwen3-asr-0.6b-q8_0.gguf".into()
 }
 
 impl Default for ModelConfig {
@@ -604,7 +604,7 @@ mod tests {
         assert_eq!(cfg.audio.silence_gap_ms, 500);
         assert_eq!(cfg.audio.max_edit_seconds, 300);
         assert_eq!(cfg.model.residency, ModelResidency::Preload);
-        assert!(cfg.model.path.ends_with("ggml-base.en.bin"));
+        assert!(cfg.model.path.ends_with("qwen3-asr-0.6b-q8_0.gguf"));
         assert!(!cfg.model.path.starts_with('~'));
         assert_eq!(cfg.overlay.anchor, OverlayAnchor::Bottom);
         assert_eq!(cfg.overlay.margin, 16);

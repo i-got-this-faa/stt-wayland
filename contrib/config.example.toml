@@ -16,7 +16,7 @@ stt_channel_capacity = 8
 
 [model]
 # File under directory (or absolute path).
-path = "~/.local/share/sttd/models/ggml-base.en.bin"
+path = "~/.local/share/sttd/models/qwen3-asr-0.6b-q8_0.gguf"
 # preload = load at daemon start; lazy = load on first Start.
 residency = "preload"
 # 0 = library default / auto.

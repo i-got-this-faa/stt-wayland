@@ -3,7 +3,7 @@ name = "sttd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Wayland speech-to-text daemon (PipeWire + transcribe.cpp + gtk4 overlay)"
+description = "Wayland speech-to-text daemon (PipeWire + audio.cpp + gtk4 overlay)"
 publish = false
 
 [[bin]]
@@ -20,7 +20,7 @@ default = ["audio", "stt-engine", "overlay", "inject", "tray", "settings"]
 # Optional feature gates so proto/cli (and minimal daemon stubs) can check without
 # full system libraries. Default enables the full stack when libs are present.
 audio = ["dep:pipewire"]
-stt-engine = ["dep:transcribe-cpp", "dep:webrtc-vad"]
+stt-engine = ["dep:audio-cpp", "dep:webrtc-vad"]
 overlay = ["dep:gtk4", "dep:gtk4-layer-shell", "dep:glib"]
 inject = ["dep:wayland-client", "dep:wayland-protocols", "dep:wayland-protocols-misc"]
 tray = ["dep:ksni", "dep:resvg"]
@@ -45,7 +45,7 @@ sha2 = { workspace = true, optional = true }
 # Optional system-backed crates (enabled by default features)
 pipewire = { workspace = true, optional = true }
 webrtc-vad = { workspace = true, optional = true }
-transcribe-cpp = { workspace = true, optional = true }
+audio-cpp = { workspace = true, optional = true }
 gtk4 = { workspace = true, optional = true }
 gtk4-layer-shell = { workspace = true, optional = true }
 glib = { workspace = true, optional = true }

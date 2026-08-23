@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use adw::prelude::*;
 use anyhow::{Context, Result};
+use glib::value::ToValue;
 use gtk4::{gio, glib};
 
 use config::{default_models_dir, Config, ModelResidency, OverlayAnchor, ProfileStore};
@@ -300,6 +301,89 @@ fn entry_row(title: &str, tooltip: &str) -> adw::EntryRow {
     row
 }
 
+struct SettingsSection {
+    name: &'static str,
+    title: &'static str,
+    sidebar_subtitle: &'static str,
+    description: &'static str,
+    icon_name: &'static str,
+}
+
+const SETTINGS_SECTIONS: [SettingsSection; 3] = [
+    SettingsSection {
+        name: "speech",
+        title: "Speech",
+        sidebar_subtitle: "Model and recognition",
+        description: "Choose the model and tune recognition behavior.",
+        icon_name: "audio-input-microphone-symbolic",
+    },
+    SettingsSection {
+        name: "audio",
+        title: "Audio",
+        sidebar_subtitle: "Capture and detection",
+        description: "Choose the audio source and when a speech chunk ends.",
+        icon_name: "audio-card-symbolic",
+    },
+    SettingsSection {
+        name: "interface",
+        title: "Interface",
+        sidebar_subtitle: "Overlay and text input",
+        description: "Control what sttd shows and how text enters the focused window.",
+        icon_name: "video-display-symbolic",
+    },
+];
+
+/// Builds a responsive two-column settings destination.
+fn settings_page(
+    section: &SettingsSection,
+    groups: &[&adw::PreferencesGroup],
+) -> gtk4::ScrolledWindow {
+    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 28);
+    content.set_margin_top(40);
+    content.set_margin_bottom(48);
+    content.set_margin_start(32);
+    content.set_margin_end(32);
+    content.set_valign(gtk4::Align::Start);
+
+    let heading = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    let title = gtk4::Label::new(Some(section.title));
+    title.set_xalign(0.0);
+    title.add_css_class("title-1");
+    let description = gtk4::Label::new(Some(section.description));
+    description.set_xalign(0.0);
+    description.set_wrap(true);
+    description.add_css_class("dim-label");
+    heading.append(&title);
+    heading.append(&description);
+    content.append(&heading);
+
+    let group_grid = gtk4::FlowBox::builder()
+        .column_spacing(24)
+        .row_spacing(24)
+        .min_children_per_line(1)
+        .max_children_per_line(2)
+        .homogeneous(true)
+        .selection_mode(gtk4::SelectionMode::None)
+        .hexpand(true)
+        .build();
+    for group in groups {
+        group.set_size_request(460, -1);
+        group.set_hexpand(true);
+        group_grid.append(*group);
+    }
+    content.append(&group_grid);
+
+    let clamp = adw::Clamp::builder()
+        .maximum_size(1180)
+        .tightening_threshold(960)
+        .child(&content)
+        .build();
+    gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .child(&clamp)
+        .build()
+}
+
 fn build_ui(app: &adw::Application) -> Result<()> {
     let store = ProfileStore::default();
     store
@@ -326,13 +410,19 @@ fn build_ui(app: &adw::Application) -> Result<()> {
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("STT Settings")
-        .default_width(680)
-        .default_height(840)
+        .default_width(1000)
+        .default_height(720)
         .build();
 
     // ── Header bar: window title plus the primary actions ────────────
     let header = adw::HeaderBar::new();
-    header.set_title_widget(Some(&adw::WindowTitle::new("STT Settings", "")));
+    let window_title = adw::WindowTitle::new("Settings", "Speech");
+    header.set_title_widget(Some(&window_title));
+
+    let sidebar_button = gtk4::Button::from_icon_name("view-list-symbolic");
+    sidebar_button.set_tooltip_text(Some("Show settings categories"));
+    sidebar_button.set_visible(false);
+    header.pack_start(&sidebar_button);
 
     let save_button = gtk4::Button::with_label("Save");
     save_button.set_tooltip_text(Some("Save changes to the selected profile"));
@@ -352,15 +442,8 @@ fn build_ui(app: &adw::Application) -> Result<()> {
     banner.connect_button_clicked(|banner| banner.set_revealed(false));
     toolbar.add_top_bar(&banner);
 
-    // ── Preferences page ─────────────────────────────────────────────
-    let page = adw::PreferencesPage::new();
-
     let profile_group = adw::PreferencesGroup::new();
     profile_group.set_title("Profile");
-    profile_group.set_description(Some(
-        "Each profile holds a complete configuration. Save writes changes to the \
-         selected profile; Apply also makes it the daemon's active configuration.",
-    ));
     let profile_menu = gio::Menu::new();
     profile_menu.append(Some("New Profile…"), Some("win.new-profile"));
     profile_menu.append(Some("Duplicate Profile"), Some("win.duplicate-profile"));
@@ -374,50 +457,179 @@ fn build_ui(app: &adw::Application) -> Result<()> {
     profile_menu_button.add_css_class("flat");
     form.profiles.add_suffix(&profile_menu_button);
     profile_group.add(&form.profiles);
-    page.add(&profile_group);
 
     let model_group = adw::PreferencesGroup::new();
-    model_group.set_title("Model");
+    model_group.set_title("Speech Model");
     model_group.set_description(Some(
         "Models are downloaded into the app data directory and verified before installation.",
     ));
     model_group.add(&form.model_picker);
     model_group.add(&form.residency);
-    model_group.add(&form.threads);
-    model_group.add(&form.language);
-    page.add(&model_group);
 
-    let audio_group = adw::PreferencesGroup::new();
-    audio_group.set_title("Audio");
-    audio_group.add(&form.sample_rate);
-    audio_group.add(&form.channels);
-    audio_group.add(&form.vad_silence_ms);
-    audio_group.add(&form.max_edit_seconds);
-    audio_group.add(&form.stt_channel_capacity);
-    audio_group.add(&form.node_name);
-    page.add(&audio_group);
+    let recognition_group = adw::PreferencesGroup::new();
+    recognition_group.set_title("Recognition");
+    recognition_group.set_description(Some("Set the language hint and inference thread count."));
+    recognition_group.add(&form.threads);
+    recognition_group.add(&form.language);
+
+    let capture_group = adw::PreferencesGroup::new();
+    capture_group.set_title("Capture");
+    capture_group.set_description(Some(
+        "Choose the PipeWire source and captured audio format.",
+    ));
+    capture_group.add(&form.sample_rate);
+    capture_group.add(&form.channels);
+    capture_group.add(&form.node_name);
+
+    let detection_group = adw::PreferencesGroup::new();
+    detection_group.set_title("Speech Detection");
+    detection_group.set_description(Some(
+        "Control when speech ends and how audio reaches transcription.",
+    ));
+    detection_group.add(&form.vad_silence_ms);
+    detection_group.add(&form.max_edit_seconds);
+    detection_group.add(&form.stt_channel_capacity);
 
     let overlay_group = adw::PreferencesGroup::new();
-    overlay_group.set_title("Overlay");
+    overlay_group.set_title("Desktop Feedback");
+    overlay_group.set_description(Some(
+        "Configure the live transcription card and system tray.",
+    ));
     overlay_group.add(&form.overlay_enabled);
     overlay_group.add(&form.overlay_anchor);
     overlay_group.add(&form.overlay_margin);
     overlay_group.add(&form.crossfade_ms);
-    page.add(&overlay_group);
+    overlay_group.add(&form.tray_enabled);
 
     let injection_group = adw::PreferencesGroup::new();
-    injection_group.set_title("Injection");
+    injection_group.set_title("Text Injection");
+    injection_group.set_description(Some(
+        "Control how transcribed text enters the focused window.",
+    ));
     injection_group.add(&form.injection_enabled);
     injection_group.add(&form.batch_mode);
     injection_group.add(&form.char_delay_ms);
-    page.add(&injection_group);
 
-    let tray_group = adw::PreferencesGroup::new();
-    tray_group.set_title("Tray");
-    tray_group.add(&form.tray_enabled);
-    page.add(&tray_group);
+    let stack = gtk4::Stack::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .transition_type(gtk4::StackTransitionType::Crossfade)
+        .transition_duration(160)
+        .build();
+    let page_groups = [
+        [&model_group, &recognition_group],
+        [&capture_group, &detection_group],
+        [&overlay_group, &injection_group],
+    ];
+    for (section, groups) in SETTINGS_SECTIONS.iter().zip(page_groups) {
+        stack.add_named(&settings_page(section, &groups), Some(section.name));
+    }
 
-    toolbar.set_content(Some(&page));
+    let navigation = gtk4::ListBox::new();
+    navigation.set_selection_mode(gtk4::SelectionMode::Single);
+    navigation.set_activate_on_single_click(true);
+    navigation.set_margin_top(12);
+    navigation.set_margin_bottom(12);
+    navigation.set_margin_start(12);
+    navigation.set_margin_end(12);
+    navigation.add_css_class("navigation-sidebar");
+    for section in &SETTINGS_SECTIONS {
+        let row = adw::ActionRow::builder()
+            .title(section.title)
+            .subtitle(section.sidebar_subtitle)
+            .activatable(true)
+            .build();
+        let icon = gtk4::Image::from_icon_name(section.icon_name);
+        row.add_prefix(&icon);
+        navigation.append(&row);
+    }
+
+    let brand = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+    brand.set_margin_top(20);
+    brand.set_margin_bottom(12);
+    brand.set_margin_start(20);
+    brand.set_margin_end(20);
+    let brand_icon = gtk4::Image::from_icon_name("audio-input-microphone-symbolic");
+    brand_icon.set_pixel_size(28);
+    let brand_copy = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+    let brand_title = gtk4::Label::new(Some("sttd"));
+    brand_title.set_xalign(0.0);
+    brand_title.add_css_class("title-3");
+    let brand_subtitle = gtk4::Label::new(Some("Speech to text"));
+    brand_subtitle.set_xalign(0.0);
+    brand_subtitle.add_css_class("dim-label");
+    brand_copy.append(&brand_title);
+    brand_copy.append(&brand_subtitle);
+    brand.append(&brand_icon);
+    brand.append(&brand_copy);
+
+    let sidebar = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    sidebar.set_size_request(280, -1);
+    sidebar.add_css_class("sidebar");
+    sidebar.append(&brand);
+    sidebar.append(&navigation);
+    let sidebar_spacer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    sidebar_spacer.set_vexpand(true);
+    sidebar.append(&sidebar_spacer);
+    sidebar.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+    profile_group.set_margin_top(12);
+    profile_group.set_margin_bottom(16);
+    profile_group.set_margin_start(12);
+    profile_group.set_margin_end(12);
+    sidebar.append(&profile_group);
+
+    let split_view = adw::OverlaySplitView::builder()
+        .sidebar(&sidebar)
+        .content(&stack)
+        .min_sidebar_width(280.0)
+        .max_sidebar_width(280.0)
+        .pin_sidebar(true)
+        .show_sidebar(true)
+        .build();
+    toolbar.set_content(Some(&split_view));
+
+    // Below tablet width the sidebar becomes a dismissible overlay.
+    let narrow = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+        adw::BreakpointConditionLengthType::MaxWidth,
+        760.0,
+        adw::LengthUnit::Px,
+    ));
+    narrow.add_setter(&split_view, "collapsed", Some(&true.to_value()));
+    narrow.add_setter(&split_view, "pin-sidebar", Some(&false.to_value()));
+    narrow.add_setter(&split_view, "show-sidebar", Some(&false.to_value()));
+    window.add_breakpoint(narrow);
+
+    split_view
+        .bind_property("collapsed", &sidebar_button, "visible")
+        .sync_create()
+        .build();
+    {
+        let split_view = split_view.clone();
+        sidebar_button.connect_clicked(move |_| {
+            split_view.set_show_sidebar(!split_view.shows_sidebar());
+        });
+    }
+    {
+        let split_view = split_view.clone();
+        let window_title = window_title.clone();
+        let stack = stack.clone();
+        navigation.connect_row_selected(move |_, row| {
+            let Some(section) = row
+                .and_then(|row| usize::try_from(row.index()).ok())
+                .and_then(|index| SETTINGS_SECTIONS.get(index))
+            else {
+                return;
+            };
+            stack.set_visible_child_name(section.name);
+            window_title.set_subtitle(section.title);
+            if split_view.is_collapsed() {
+                split_view.set_show_sidebar(false);
+            }
+        });
+    }
+    if let Some(first_row) = navigation.row_at_index(0) {
+        navigation.select_row(Some(&first_row));
+    }
 
     let toast_overlay = adw::ToastOverlay::new();
     toast_overlay.set_child(Some(&toolbar));

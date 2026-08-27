@@ -55,6 +55,12 @@ gtk4-layer-shell = "0.4"
 glib = "0.20"
 adw = { version = "0.7", package = "libadwaita", features = ["v1_5"] }
 
+# Post-processing (local text-normalization models, e.g. superwhisper/s1-mini).
+# Pure-Rust ggml via candle; tokenizers only needs the onig regex backend.
+candle-core = "0.11"
+candle-transformers = "0.11"
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+
 # Wayland injection (virtual-keyboard-unstable-v1)
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client"] }

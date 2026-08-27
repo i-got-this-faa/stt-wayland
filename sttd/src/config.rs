@@ -33,6 +33,7 @@ pub struct Config {
     pub overlay: OverlayConfig,
     pub injection: InjectionConfig,
     pub tray: TrayConfig,
+    pub post_process: PostProcessConfig,
 }
 
 impl Default for Config {
@@ -43,6 +44,7 @@ impl Default for Config {
             overlay: OverlayConfig::default(),
             injection: InjectionConfig::default(),
             tray: TrayConfig::default(),
+            post_process: PostProcessConfig::default(),
         };
         cfg.normalize();
         cfg
@@ -272,6 +274,80 @@ impl Default for TrayConfig {
     }
 }
 
+// ─── Post-processing ────────────────────────────────────────────────────────
+
+/// Post-processing phase configuration (text normalization on final
+/// transcripts: punctuation, casing, inverse text normalization).
+///
+/// Models are local GGUF files from the post-processing catalog
+/// (`model_catalog::POST_PROCESS_CATALOG`), managed by `stt-settings`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PostProcessConfig {
+    /// Run final transcripts through the normalization model.
+    pub enabled: bool,
+
+    /// Post-processing model id from the catalog (default: `s1-mini`).
+    pub model: String,
+
+    /// Control line — register: `casual`, `semi-casual`, `semi-formal`,
+    /// `formal` (model card's trained values; clamped by normalize).
+    pub styling: String,
+
+    /// Control line — layout: `prose` or `lists`.
+    pub structure: String,
+
+    /// Control line — destination conventions: `general` or `email`.
+    pub context: String,
+}
+
+impl Default for PostProcessConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: "s1-mini".into(),
+            styling: "semi-formal".into(),
+            structure: "prose".into(),
+            context: "general".into(),
+        }
+    }
+}
+
+impl PostProcessConfig {
+    /// `(config value, display label)` pairs for the styling axis.
+    pub const STYLINGS: &'static [(&'static str, &'static str)] = &[
+        ("casual", "Casual"),
+        ("semi-casual", "Semi-Casual"),
+        ("semi-formal", "Semi-Formal"),
+        ("formal", "Formal"),
+    ];
+
+    /// `(config value, display label)` pairs for the structure axis.
+    pub const STRUCTURES: &'static [(&'static str, &'static str)] =
+        &[("prose", "Prose"), ("lists", "Lists")];
+
+    /// `(config value, display label)` pairs for the context axis.
+    pub const CONTEXTS: &'static [(&'static str, &'static str)] =
+        &[("general", "General"), ("email", "Email")];
+
+    /// Clamp unknown values to trained defaults so a hand-edited config can
+    /// never feed out-of-distribution control lines to the model.
+    pub fn normalize(&mut self) {
+        self.styling = normalize_axis(&self.styling, Self::STYLINGS, "semi-formal");
+        self.structure = normalize_axis(&self.structure, Self::STRUCTURES, "prose");
+        self.context = normalize_axis(&self.context, Self::CONTEXTS, "general");
+    }
+}
+
+fn normalize_axis(value: &str, allowed: &[(&str, &str)], fallback: &str) -> String {
+    let trimmed = value.trim().to_ascii_lowercase();
+    if allowed.iter().any(|(name, _)| *name == trimmed) {
+        trimmed
+    } else {
+        fallback.to_string()
+    }
+}
+
 // ─── Load / save ────────────────────────────────────────────────────────────
 
 impl Config {
@@ -322,6 +398,9 @@ impl Config {
 
         // Sync legacy overlay crossfade field used by `overlay` module.
         self.overlay.preview_crossfade_ms = self.overlay.crossfade_ms;
+
+        // Clamp post-processing control-line values to the trained sets.
+        self.post_process.normalize();
 
         // Edit buffer cap: `audio.max_edit_seconds` is canonical (§11).
         // Legacy TOML may only set `overlay.edit_buffer_cap_secs` — mirror that
@@ -663,6 +742,47 @@ enabled = false
         assert_eq!(cfg.overlay.preview_crossfade_ms, 150);
         assert!(cfg.injection.batch_mode);
         assert!(!cfg.tray.enabled);
+        // Post-processing defaults: off, s1-mini, semi-formal/prose/general.
+        assert!(!cfg.post_process.enabled);
+        assert_eq!(cfg.post_process.model, "s1-mini");
+        assert_eq!(cfg.post_process.styling, "semi-formal");
+        assert_eq!(cfg.post_process.structure, "prose");
+        assert_eq!(cfg.post_process.context, "general");
+    }
+
+    #[test]
+    fn post_process_toml_and_axis_clamping() {
+        let toml = r#"
+[post_process]
+enabled = true
+model = "s1-mini"
+styling = "Formal"
+structure = "lists"
+context = "email"
+"#;
+        let mut cfg: Config = toml::from_str(toml).unwrap();
+        cfg.normalize();
+
+        assert!(cfg.post_process.enabled);
+        assert_eq!(cfg.post_process.model, "s1-mini");
+        assert_eq!(cfg.post_process.styling, "formal");
+        assert_eq!(cfg.post_process.structure, "lists");
+        assert_eq!(cfg.post_process.context, "email");
+
+        // Unknown axis values fall back to the trained defaults.
+        let mut cfg: Config = toml::from_str(
+            r#"
+[post_process]
+styling = "shouty"
+structure = "haiku"
+context = "slack"
+"#,
+        )
+        .unwrap();
+        cfg.normalize();
+        assert_eq!(cfg.post_process.styling, "semi-formal");
+        assert_eq!(cfg.post_process.structure, "prose");
+        assert_eq!(cfg.post_process.context, "general");
     }
 
     #[test]

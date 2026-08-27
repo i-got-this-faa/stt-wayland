@@ -21,7 +21,9 @@
 mod audio;
 mod config;
 mod inject;
+mod model_catalog;
 mod overlay;
+mod postprocess;
 mod state;
 mod stt;
 mod tray;
@@ -521,6 +523,7 @@ impl Daemon {
 
         let stt = match SttEngine::spawn(
             &cfg.model,
+            &cfg.post_process,
             cfg.audio.stt_channel_capacity,
             stt::DEFAULT_OVERLAP_MS,
         ) {
@@ -532,6 +535,7 @@ impl Daemon {
                 lazy.residency = ModelResidency::Lazy;
                 SttEngine::spawn(
                     &lazy,
+                    &cfg.post_process,
                     cfg.audio.stt_channel_capacity,
                     stt::DEFAULT_OVERLAP_MS,
                 )

@@ -25,10 +25,13 @@ use anyhow::{Context, Result};
 use glib::value::ToValue;
 use gtk4::{gio, glib};
 
-use config::{default_models_dir, Config, ModelResidency, OverlayAnchor, ProfileStore};
+use config::{
+    default_models_dir, Config, ModelResidency, OverlayAnchor, PostProcessConfig, ProfileStore,
+};
 use model_catalog::{
-    delete_managed_model, download_model, format_size, install_state, managed_model_path,
-    model_for_filename, InstallState, ModelSpec, MODEL_CATALOG,
+    delete_managed_model, delete_post_process_model, download_model, download_post_process_model,
+    format_size, install_state, managed_model_path, model_for_filename, post_process_install_state,
+    InstallState, ModelSpec, POST_PROCESS_CATALOG, MODEL_CATALOG,
 };
 
 const ANCHORS: [(OverlayAnchor, &str); 9] = [
@@ -98,6 +101,10 @@ struct Form {
     model_choices: RefCell<Vec<ModelChoice>>,
     model_busy: Cell<bool>,
     model_cancel: RefCell<Option<Arc<AtomicBool>>>,
+    /// Post-processing catalog ids backing `pp_model_picker`.
+    pp_model_choices: RefCell<Vec<&'static model_catalog::PostProcessModelSpec>>,
+    pp_model_busy: Cell<bool>,
+    pp_model_cancel: RefCell<Option<Arc<AtomicBool>>>,
     profiles: adw::ComboRow,
     model_picker: adw::ComboRow,
     model_action_button: gtk4::Button,
@@ -120,6 +127,13 @@ struct Form {
     batch_mode: adw::SwitchRow,
     char_delay_ms: adw::SpinRow,
     tray_enabled: adw::SwitchRow,
+    pp_enabled: adw::SwitchRow,
+    pp_model_picker: adw::ComboRow,
+    pp_model_action_button: gtk4::Button,
+    pp_model_progress: gtk4::ProgressBar,
+    pp_styling: adw::ComboRow,
+    pp_structure: adw::ComboRow,
+    pp_context: adw::ComboRow,
 }
 
 impl Form {
@@ -240,11 +254,65 @@ impl Form {
 
         let tray_enabled = switch_row("Enable Tray Icon", "Show a status icon in the system tray");
 
+        let pp_model_picker = adw::ComboRow::new();
+        pp_model_picker.set_title("Normalization Model");
+        pp_model_picker.set_subtitle("Choose an installed model or one to download");
+
+        let pp_model_action_button = gtk4::Button::from_icon_name("folder-download-symbolic");
+        pp_model_action_button.set_tooltip_text(Some("Download selected model"));
+        pp_model_action_button.set_valign(gtk4::Align::Center);
+        pp_model_action_button.add_css_class("flat");
+
+        let pp_model_progress = gtk4::ProgressBar::new();
+        pp_model_progress.set_show_text(true);
+        pp_model_progress.set_size_request(110, -1);
+        pp_model_progress.set_valign(gtk4::Align::Center);
+        pp_model_progress.set_opacity(0.0);
+
+        let pp_model_controls = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        pp_model_controls.set_size_request(154, -1);
+        pp_model_controls.set_halign(gtk4::Align::End);
+        pp_model_controls.set_valign(gtk4::Align::Center);
+        pp_model_controls.append(&pp_model_progress);
+        pp_model_controls.append(&pp_model_action_button);
+        pp_model_picker.add_suffix(&pp_model_controls);
+
+        let pp_enabled = switch_row(
+            "Enable Post-Processing",
+            "Rewrite final transcripts with a local normalization model",
+        );
+
+        let axis_combo = |axis: &[(&str, &str)], title: &str, subtitle: &str| {
+            let labels: Vec<&str> = axis.iter().map(|(_, label)| *label).collect();
+            let row = string_combo(&labels);
+            row.set_title(title);
+            row.set_subtitle(subtitle);
+            row
+        };
+        let pp_styling = axis_combo(
+            PostProcessConfig::STYLINGS,
+            "Styling",
+            "Register of the written text",
+        );
+        let pp_structure = axis_combo(
+            PostProcessConfig::STRUCTURES,
+            "Structure",
+            "Allow breaking enumerations into lists",
+        );
+        let pp_context = axis_combo(
+            PostProcessConfig::CONTEXTS,
+            "Context",
+            "Destination conventions for the text",
+        );
+
         Self {
             updating: Cell::new(false),
             model_choices: RefCell::new(Vec::new()),
             model_busy: Cell::new(false),
             model_cancel: RefCell::new(None),
+            pp_model_choices: RefCell::new(Vec::new()),
+            pp_model_busy: Cell::new(false),
+            pp_model_cancel: RefCell::new(None),
             profiles,
             model_picker,
             model_action_button,
@@ -267,6 +335,13 @@ impl Form {
             batch_mode,
             char_delay_ms,
             tray_enabled,
+            pp_enabled,
+            pp_model_picker,
+            pp_model_action_button,
+            pp_model_progress,
+            pp_styling,
+            pp_structure,
+            pp_context,
         }
     }
 }
@@ -306,13 +381,20 @@ struct SettingsSection {
     icon_name: &'static str,
 }
 
-const SETTINGS_SECTIONS: [SettingsSection; 3] = [
+const SETTINGS_SECTIONS: [SettingsSection; 4] = [
     SettingsSection {
         name: "speech",
         title: "Speech",
         sidebar_subtitle: "Model and recognition",
         description: "Choose the model and tune recognition behavior.",
         icon_name: "audio-input-microphone-symbolic",
+    },
+    SettingsSection {
+        name: "polish",
+        title: "Post-Processing",
+        sidebar_subtitle: "Text normalization",
+        description: "Clean up final transcripts with a local normalization model.",
+        icon_name: "spell-check-symbolic",
     },
     SettingsSection {
         name: "audio",
@@ -462,6 +544,23 @@ fn build_ui(app: &adw::Application) -> Result<()> {
     model_group.add(&form.model_picker);
     model_group.add(&form.residency);
 
+    let pp_model_group = adw::PreferencesGroup::new();
+    pp_model_group.set_title("Normalization Model");
+    pp_model_group.set_description(Some(
+        "Downloads are verified and installed under the app data directory.",
+    ));
+    pp_model_group.add(&form.pp_model_picker);
+
+    let pp_rules_group = adw::PreferencesGroup::new();
+    pp_rules_group.set_title("Normalization Rules");
+    pp_rules_group.set_description(Some(
+        "Control-line values steer the model; only the trained combinations are offered.",
+    ));
+    pp_rules_group.add(&form.pp_enabled);
+    pp_rules_group.add(&form.pp_styling);
+    pp_rules_group.add(&form.pp_structure);
+    pp_rules_group.add(&form.pp_context);
+
     let recognition_group = adw::PreferencesGroup::new();
     recognition_group.set_title("Recognition");
     recognition_group.set_description(Some("Set the language hint and inference thread count."));
@@ -514,6 +613,7 @@ fn build_ui(app: &adw::Application) -> Result<()> {
         .build();
     let page_groups = [
         [&model_group, &recognition_group],
+        [&pp_model_group, &pp_rules_group],
         [&capture_group, &detection_group],
         [&overlay_group, &injection_group],
     ];
@@ -665,6 +765,7 @@ fn build_ui(app: &adw::Application) -> Result<()> {
         &save_button,
         &apply_button,
         &form.model_action_button,
+        &form.pp_model_action_button,
     );
 
     refresh_profiles(&form, &state);
@@ -682,6 +783,7 @@ fn connect_signals(
     save_button: &gtk4::Button,
     apply_button: &gtk4::Button,
     model_action_button: &gtk4::Button,
+    pp_model_action_button: &gtk4::Button,
 ) {
     // Selecting a profile loads it into the form.
     {
@@ -770,6 +872,40 @@ fn connect_signals(
         let model_action_button = model_action_button.clone();
         model_action_button.connect_clicked(move |_| {
             manage_selected_model(&window, &overlay, &form, &state);
+        });
+    }
+
+    // Post-processing model management (download / cancel / delete).
+    {
+        let window = window.clone();
+        let overlay = overlay.clone();
+        let form = Rc::clone(form);
+        let state = Rc::clone(state);
+        let pp_model_action_button = pp_model_action_button.clone();
+        pp_model_action_button.connect_clicked(move |_| {
+            manage_selected_pp_model(&window, &overlay, &form, &state);
+        });
+    }
+
+    // Keep the install-state subtitle fresh while picking or toggling.
+    {
+        let form = Rc::clone(form);
+        let picker = form.pp_model_picker.clone();
+        picker.connect_selected_notify(move |_| {
+            if form.updating.get() {
+                return;
+            }
+            update_pp_model_manager(&form);
+        });
+    }
+    {
+        let form = Rc::clone(form);
+        let toggle = form.pp_enabled.clone();
+        toggle.connect_active_notify(move |_| {
+            if form.updating.get() {
+                return;
+            }
+            update_pp_model_manager(&form);
         });
     }
 
@@ -1198,6 +1334,25 @@ fn selected_model_is_ready(form: &Form, overlay: &adw::ToastOverlay) -> bool {
         );
         return false;
     }
+    if form.pp_model_busy.get() {
+        toast_error(
+            overlay,
+            "Wait for the post-processing model download to finish or cancel it first.",
+        );
+        return false;
+    }
+    if form.pp_enabled.is_active() {
+        let ready = selected_pp_spec(form).is_some_and(|spec| {
+            post_process_install_state(&default_models_dir(), spec) == InstallState::Installed
+        });
+        if !ready {
+            toast_error(
+                overlay,
+                "Download the selected post-processing model (or disable post-processing) before saving this profile.",
+            );
+            return false;
+        }
+    }
     match selected_model_choice(form) {
         Some(ModelChoice::Catalog(spec)) => match install_state(&default_models_dir(), spec) {
             InstallState::Installed => true,
@@ -1551,6 +1706,340 @@ fn profiles_using_model(state: &Rc<RefCell<EditorState>>, target: &Path) -> Resu
     Ok(profiles)
 }
 
+// ─── Post-processing model management ───────────────────────────────────────
+
+fn refresh_pp_models(form: &Form, cfg: &Config) {
+    form.updating.set(true);
+    let models_dir = default_models_dir();
+    let list = gtk4::StringList::new(&[]);
+    let mut choices = Vec::with_capacity(POST_PROCESS_CATALOG.len());
+    for spec in POST_PROCESS_CATALOG {
+        list.append(&pp_catalog_label(
+            spec,
+            post_process_install_state(&models_dir, spec),
+        ));
+        choices.push(spec);
+    }
+    form.pp_model_picker.set_model(Some(&list));
+    *form.pp_model_choices.borrow_mut() = choices;
+
+    let selected = form
+        .pp_model_choices
+        .borrow()
+        .iter()
+        .position(|spec| spec.id == cfg.post_process.model)
+        .map_or(gtk4::INVALID_LIST_POSITION, |index| index as u32);
+    form.pp_model_picker.set_selected(selected);
+    form.updating.set(false);
+    update_pp_model_manager(form);
+}
+
+fn selected_pp_spec(form: &Form) -> Option<&'static model_catalog::PostProcessModelSpec> {
+    let selected = form.pp_model_picker.selected();
+    if selected == gtk4::INVALID_LIST_POSITION {
+        return None;
+    }
+    form.pp_model_choices.borrow().get(selected as usize).copied()
+}
+
+fn pp_catalog_label(
+    spec: &model_catalog::PostProcessModelSpec,
+    install: InstallState,
+) -> String {
+    let recommendation = if spec.recommended {
+        "Recommended, "
+    } else {
+        ""
+    };
+    let status = match install {
+        InstallState::Installed => "Installed",
+        InstallState::Missing => "Download",
+        InstallState::Invalid => "Invalid file",
+    };
+    format!(
+        "{} ({}{} - {})",
+        spec.name,
+        recommendation,
+        status,
+        format_size(spec.size_bytes)
+    )
+}
+
+fn update_pp_model_manager(form: &Form) {
+    if form.pp_model_busy.get() {
+        return;
+    }
+
+    form.pp_model_progress.set_opacity(0.0);
+    form.pp_model_progress.set_text(None);
+    match selected_pp_spec(form) {
+        Some(spec) => {
+            let install = post_process_install_state(&default_models_dir(), spec);
+            let total = format_size(spec.size_bytes + spec.tokenizer_size_bytes);
+            let status = match install {
+                InstallState::Installed => "Installed",
+                InstallState::Missing => "Download required",
+                InstallState::Invalid => "Invalid file - delete before downloading",
+            };
+            form.pp_model_picker.set_subtitle(&format!(
+                "{} | {} | {} | {}",
+                spec.family, spec.languages, total, status
+            ));
+            form.pp_model_picker.set_tooltip_text(Some(&format!(
+                "{} License: {}.",
+                spec.description, spec.license
+            )));
+            form.pp_model_action_button.set_visible(true);
+            form.pp_model_action_button.set_sensitive(true);
+            if install != InstallState::Missing {
+                form.pp_model_action_button
+                    .set_icon_name("user-trash-symbolic");
+                form.pp_model_action_button
+                    .set_tooltip_text(Some("Delete selected model"));
+                form.pp_model_action_button.add_css_class("destructive-action");
+            } else {
+                form.pp_model_action_button
+                    .set_icon_name("folder-download-symbolic");
+                form.pp_model_action_button
+                    .set_tooltip_text(Some("Download selected model"));
+                form.pp_model_action_button
+                    .remove_css_class("destructive-action");
+            }
+        }
+        None => {
+            form.pp_model_picker
+                .set_subtitle("Select an installed model or one to download");
+            form.pp_model_picker.set_tooltip_text(None);
+            form.pp_model_action_button.set_visible(false);
+        }
+    }
+}
+
+fn manage_selected_pp_model(
+    window: &adw::ApplicationWindow,
+    overlay: &adw::ToastOverlay,
+    form: &Rc<Form>,
+    state: &Rc<RefCell<EditorState>>,
+) {
+    let Some(spec) = selected_pp_spec(form) else {
+        return;
+    };
+    if form.pp_model_busy.get() {
+        if let Some(cancel) = form.pp_model_cancel.borrow().as_ref() {
+            cancel.store(true, Ordering::Release);
+            form.pp_model_action_button.set_sensitive(false);
+            form.pp_model_progress.set_text(Some("Cancelling"));
+        }
+        return;
+    }
+    match post_process_install_state(&default_models_dir(), spec) {
+        InstallState::Installed | InstallState::Invalid => {
+            confirm_delete_pp_model(window, overlay, form, state, spec)
+        }
+        InstallState::Missing => start_pp_model_download(window, overlay, form, state, spec),
+    }
+}
+
+fn start_pp_model_download(
+    window: &adw::ApplicationWindow,
+    overlay: &adw::ToastOverlay,
+    form: &Rc<Form>,
+    state: &Rc<RefCell<EditorState>>,
+    spec: &'static model_catalog::PostProcessModelSpec,
+) {
+    if form.pp_model_busy.replace(true) {
+        return;
+    }
+
+    form.pp_model_picker.set_activatable(false);
+    form.profiles.set_sensitive(false);
+    window.set_deletable(false);
+    form.pp_model_picker
+        .set_subtitle(&format!("Downloading {}", spec.name));
+    form.pp_model_action_button
+        .set_icon_name("process-stop-symbolic");
+    form.pp_model_action_button
+        .set_tooltip_text(Some("Cancel model download"));
+    form.pp_model_action_button
+        .remove_css_class("destructive-action");
+    form.pp_model_action_button.set_sensitive(true);
+    form.pp_model_action_button.set_visible(true);
+    form.pp_model_progress.set_fraction(0.0);
+    form.pp_model_progress.set_text(Some("Starting"));
+    form.pp_model_progress.set_opacity(1.0);
+
+    let (sender, receiver) = mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    *form.pp_model_cancel.borrow_mut() = Some(Arc::clone(&cancel));
+    let models_dir = default_models_dir();
+    let worker = thread::Builder::new()
+        .name(format!("sttd-post-process-{}", spec.id))
+        .spawn(move || {
+            let progress_sender = sender.clone();
+            let result =
+                download_post_process_model(&models_dir, spec, &cancel, move |downloaded, total| {
+                    let _ = progress_sender.send(DownloadEvent::Progress { downloaded, total });
+                })
+                .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(DownloadEvent::Finished(result));
+        });
+
+    if let Err(error) = worker {
+        form.pp_model_busy.set(false);
+        form.pp_model_cancel.borrow_mut().take();
+        form.pp_model_picker.set_activatable(true);
+        form.profiles.set_sensitive(true);
+        window.set_deletable(true);
+        update_pp_model_manager(form);
+        toast_error(overlay, &format!("Could not start model download: {error}"));
+        return;
+    }
+
+    let overlay = overlay.clone();
+    let window = window.clone();
+    let form = Rc::clone(form);
+    let state = Rc::clone(state);
+    glib::timeout_add_local(Duration::from_millis(100), move || loop {
+        match receiver.try_recv() {
+            Ok(DownloadEvent::Progress { downloaded, total }) => {
+                let fraction = if total == 0 {
+                    0.0
+                } else {
+                    downloaded.min(total) as f64 / total as f64
+                };
+                form.pp_model_progress.set_fraction(fraction);
+                form.pp_model_progress
+                    .set_text(Some(&format!("{:.0}%", fraction * 100.0)));
+            }
+            Ok(DownloadEvent::Finished(result)) => {
+                form.pp_model_busy.set(false);
+                let was_cancelled = form
+                    .pp_model_cancel
+                    .borrow_mut()
+                    .take()
+                    .is_some_and(|cancel| cancel.load(Ordering::Acquire));
+                form.pp_model_picker.set_activatable(true);
+                form.profiles.set_sensitive(true);
+                window.set_deletable(true);
+                match result {
+                    Ok(_gguf_path) => {
+                        let mut cfg = state.borrow().config.clone();
+                        cfg.post_process.model = spec.id.to_string();
+                        state.borrow_mut().config = cfg.clone();
+                        refresh_pp_models(&form, &cfg);
+                        toast(&overlay, &format!("Installed {}.", spec.name));
+                    }
+                    Err(error) => {
+                        update_pp_model_manager(&form);
+                        if was_cancelled {
+                            toast(&overlay, "Post-processing model download cancelled.");
+                        } else {
+                            toast_error(
+                                &overlay,
+                                &format!("Could not download {}: {error}", spec.name),
+                            );
+                        }
+                    }
+                }
+                return glib::ControlFlow::Break;
+            }
+            Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                form.pp_model_busy.set(false);
+                form.pp_model_cancel.borrow_mut().take();
+                form.pp_model_picker.set_activatable(true);
+                form.profiles.set_sensitive(true);
+                window.set_deletable(true);
+                update_pp_model_manager(&form);
+                toast_error(
+                    &overlay,
+                    "Post-processing model download stopped unexpectedly.",
+                );
+                return glib::ControlFlow::Break;
+            }
+        }
+    });
+}
+
+fn confirm_delete_pp_model(
+    window: &adw::ApplicationWindow,
+    overlay: &adw::ToastOverlay,
+    form: &Rc<Form>,
+    state: &Rc<RefCell<EditorState>>,
+    spec: &'static model_catalog::PostProcessModelSpec,
+) {
+    match profiles_using_pp_model(state, spec) {
+        Ok(profiles) if !profiles.is_empty() => {
+            toast_error(
+                overlay,
+                &format!(
+                    "{} is enabled in: {}. Disable post-processing or pick another model in those profiles, then save before deleting.",
+                    spec.name,
+                    profiles.join(", ")
+                ),
+            );
+            return;
+        }
+        Err(error) => {
+            toast_error(
+                overlay,
+                &format!("Could not check model usage before deletion: {error:#}"),
+            );
+            return;
+        }
+        Ok(_) => {}
+    }
+
+    let dialog = adw::AlertDialog::new(
+        Some(&format!("Delete {}?", spec.name)),
+        Some("The verified model and tokenizer files will be removed from the app's data directory."),
+    );
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("delete", "Delete");
+    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+
+    let form = Rc::clone(form);
+    let state = Rc::clone(state);
+    let overlay = overlay.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response != "delete" || form.pp_model_busy.get() {
+            return;
+        }
+        let models_dir = default_models_dir();
+        match delete_post_process_model(&models_dir, spec) {
+            Ok(()) => {
+                let cfg = state.borrow().config.clone();
+                refresh_pp_models(&form, &cfg);
+                toast(&overlay, &format!("Deleted {}.", spec.name));
+            }
+            Err(error) => toast_error(
+                &overlay,
+                &format!("Could not delete {}: {error:#}", spec.name),
+            ),
+        }
+    });
+    dialog.present(Some(window));
+}
+
+fn profiles_using_pp_model(
+    state: &Rc<RefCell<EditorState>>,
+    spec: &model_catalog::PostProcessModelSpec,
+) -> Result<Vec<String>> {
+    let store = state.borrow().store.clone();
+    let mut profiles = Vec::new();
+    for name in store.list().context("listing profiles")? {
+        let cfg = store
+            .load(&name)
+            .with_context(|| format!("loading profile '{name}'"))?;
+        if cfg.post_process.enabled && cfg.post_process.model == spec.id {
+            profiles.push(name);
+        }
+    }
+    Ok(profiles)
+}
+
 fn collect_config(state: &Rc<RefCell<EditorState>>, form: &Form) -> Config {
     let mut cfg = state.borrow().config.clone();
     cfg.model.path = form.model_path.text().to_string();
@@ -1587,6 +2076,33 @@ fn collect_config(state: &Rc<RefCell<EditorState>>, form: &Form) -> Config {
     cfg.injection.batch_mode = form.batch_mode.is_active();
     cfg.injection.char_delay_ms = spin_u32(&form.char_delay_ms);
     cfg.tray.enabled = form.tray_enabled.is_active();
+
+    cfg.post_process.enabled = form.pp_enabled.is_active();
+    if let Some(spec) = selected_pp_spec(form) {
+        cfg.post_process.model = spec.id.to_string();
+    }
+    let axis_value = |axis: &'static [(&'static str, &'static str)],
+                      picker: &adw::ComboRow,
+                      fallback: &str| {
+        axis.get(picker.selected() as usize)
+            .map(|(value, _)| (*value).to_string())
+            .unwrap_or_else(|| fallback.to_string())
+    };
+    cfg.post_process.styling = axis_value(
+        PostProcessConfig::STYLINGS,
+        &form.pp_styling,
+        &cfg.post_process.styling,
+    );
+    cfg.post_process.structure = axis_value(
+        PostProcessConfig::STRUCTURES,
+        &form.pp_structure,
+        &cfg.post_process.structure,
+    );
+    cfg.post_process.context = axis_value(
+        PostProcessConfig::CONTEXTS,
+        &form.pp_context,
+        &cfg.post_process.context,
+    );
     cfg.normalize();
     cfg
 }
@@ -1627,6 +2143,24 @@ fn populate_form(form: &Form, cfg: &Config) {
     form.char_delay_ms
         .set_value(cfg.injection.char_delay_ms as f64);
     form.tray_enabled.set_active(cfg.tray.enabled);
+
+    form.pp_enabled.set_active(cfg.post_process.enabled);
+    let axis_index = |axis: &[(&str, &str)], value: &str| -> u32 {
+        axis.iter()
+            .position(|(name, _)| *name == value)
+            .unwrap_or(0) as u32
+    };
+    form.pp_styling
+        .set_selected(axis_index(PostProcessConfig::STYLINGS, &cfg.post_process.styling));
+    form.pp_structure.set_selected(axis_index(
+        PostProcessConfig::STRUCTURES,
+        &cfg.post_process.structure,
+    ));
+    form.pp_context.set_selected(axis_index(
+        PostProcessConfig::CONTEXTS,
+        &cfg.post_process.context,
+    ));
+    refresh_pp_models(form, cfg);
     form.updating.set(false);
 }
 

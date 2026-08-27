@@ -88,10 +88,17 @@ Implemented wiring matches v1 design:
 - Edit: accumulate → full STT → EditReview; Copy/Discard
 - Overlay: Layer::Overlay; keyboard None recording; OnDemand EditReview only
 - Inject: virtual-keyboard-unstable-v1 via wayland-client (not wtype/ydotool)
+- Post-processing phase (optional): final transcripts normalized by a local
+  GGUF text model (S1-mini by Superwhisper, quantized Qwen3 via candle) inside
+  the STT worker — punctuation/casing/ITN/filler removal, `stt-settings` →
+  Post-Processing toggle + catalog-managed download; failures fall back to the
+  raw transcript.
 
 Possible follow-ups (not blockers for normal use):
 
 1. First-run helper: copy example config / print model download URL when the file is missing.
+2. More post-processing models/languages in `POST_PROCESS_CATALOG` (the
+   phase, prompt format, and settings UI are model-agnostic).
 
 ## How to bind a key
 

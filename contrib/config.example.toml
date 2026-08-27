@@ -43,3 +43,16 @@ char_delay_ms = 0
 # StatusNotifierItem tray icon. Needs a session D-Bus bus.
 # No tray host or no session bus: the icon is silently absent.
 enabled = true
+
+[post_process]
+# Text normalization applied to final (committed) transcripts:
+# punctuation, casing, spoken numbers/dates/emails, filler removal.
+# Runs locally on the CPU via candle; enable and download the model
+# in stt-settings → Post-Processing. Restart sttd after changing.
+enabled = false
+# Model id from the post-processing catalog.
+model = "s1-mini"
+# Control line steering the model — see the s1-mini model card.
+styling = "semi-formal"   # casual | semi-casual | semi-formal | formal
+structure = "prose"       # prose | lists
+context = "general"       # general | email

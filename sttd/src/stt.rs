@@ -19,6 +19,10 @@
 //! under `~/.local/share/sttd/models/`, managed by `stt-settings` via the model
 //! catalog. Residency: `preload` (default) or `lazy`.
 //!
+//! Final transcripts may additionally pass through the post-processing phase
+//! ([`crate::postprocess`], e.g. S1-mini text normalization) inside this
+//! worker, which keeps commit ordering and backpressure unchanged.
+//!
 //! # Feature flag
 //!
 //! Real inference requires the `stt-engine` feature (links `audio-cpp`).
@@ -37,7 +41,8 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use tracing::{debug, error, info, warn};
 
-use crate::config::{ModelConfig, ModelResidency};
+use crate::config::{ModelConfig, ModelResidency, PostProcessConfig};
+use crate::postprocess::PostProcessor;
 
 /// Speech engine + webrtc-vad capture rate (mono f32).
 pub const SAMPLE_RATE_HZ: u32 = 16_000;
@@ -102,15 +107,22 @@ impl SttEngine {
     ///
     /// With `ModelResidency::Preload`, blocks until the model is loaded (or
     /// returns a clear error if the file is missing / unloadable).
-    pub fn new(cfg: &ModelConfig) -> Result<Self> {
-        Self::spawn(cfg, DEFAULT_CHANNEL_CAPACITY, DEFAULT_OVERLAP_MS)
+    pub fn new(cfg: &ModelConfig, post_process: &PostProcessConfig) -> Result<Self> {
+        Self::spawn(cfg, post_process, DEFAULT_CHANNEL_CAPACITY, DEFAULT_OVERLAP_MS)
     }
 
     /// Spawn the worker thread.
     ///
     /// * `channel_capacity` — bound for command + result channels (backpressure).
     /// * `overlap_ms` — Live-mode audio tail kept from the previous chunk.
-    pub fn spawn(cfg: &ModelConfig, channel_capacity: usize, overlap_ms: u32) -> Result<Self> {
+    /// * `post_process` — optional text-normalization phase applied to final
+    ///   transcripts inside the worker (keeps commit ordering intact).
+    pub fn spawn(
+        cfg: &ModelConfig,
+        post_process: &PostProcessConfig,
+        channel_capacity: usize,
+        overlap_ms: u32,
+    ) -> Result<Self> {
         let model_path = cfg.model_path();
         let capacity = channel_capacity.max(1);
         let overlap_samples = ms_to_samples(overlap_ms, SAMPLE_RATE_HZ);
@@ -153,6 +165,7 @@ impl SttEngine {
             preload: residency == ModelResidency::Preload,
             loaded: Arc::clone(&loaded),
             preview_cancel: Arc::clone(&preview_cancel),
+            post: PostProcessor::new(post_process.clone()),
         };
 
         let join = thread::Builder::new()
@@ -355,6 +368,8 @@ struct WorkerConfig {
     preload: bool,
     loaded: Arc<AtomicBool>,
     preview_cancel: Arc<AtomicBool>,
+    /// Post-processing phase applied to final transcripts (none-op when off).
+    post: PostProcessor,
 }
 
 fn worker_main(
@@ -667,6 +682,14 @@ impl SttWorker {
 
         let text = self.run_transcription(&pcm)?;
 
+        // Post-processing phase: normalize committed text only. Previews stay
+        // raw so the overlay keeps its low latency.
+        let text = if is_final {
+            self.cfg.post.process(&text)
+        } else {
+            text
+        };
+
         if is_final {
             // Keep only the tail of the committed chunk. Preview jobs are
             // snapshots of the current utterance; updating the overlap from
@@ -712,6 +735,8 @@ impl SttWorker {
 
         self.ensure_loaded()?;
         let text = self.run_transcription(&samples)?;
+        // Post-processing phase: the Edit buffer is committed in one pass.
+        let text = self.cfg.post.process(&text);
         Ok(TranscriptResult {
             text,
             is_final: true,

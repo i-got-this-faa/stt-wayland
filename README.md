@@ -96,6 +96,7 @@ sudo dnf install gcc gcc-c++ cmake clang pkgconf-pkg-config \
 | `inject` | yes | wayland virtual-keyboard |
 | `tray` | yes | StatusNotifierItem over D-Bus |
 | `settings` | yes | GTK4 settings application |
+| `post-process` | yes | Local text normalization (candle, quantized Qwen3) |
 
 Check without system GUI/audio libs:
 
@@ -134,6 +135,40 @@ Existing custom GGUF and legacy whisper.cpp `.bin` paths remain readable from
 profiles, but catalog download and deletion are intentionally confined to the
 managed models directory.
 
+## Post-processing (text normalization)
+
+Final transcripts can pass through a local **text-normalization model** after
+recognition — punctuation and capitalization, spoken numbers/dates/emails
+written out, fillers ("um", "uh") removed. The first catalog model is
+**[S1-mini by Superwhisper](https://huggingface.co/superwhisper/s1-mini)**, a
+0.6B Qwen3 fine-tune (Q4_K_M GGUF, ~462 MiB) that runs on the CPU. Inference
+uses [candle](https://github.com/huggingface/candle) in-process — no extra
+services — on the STT worker thread, so committed text ordering and
+backpressure are unchanged.
+
+Enable it in `stt-settings` → **Post-Processing**: download the model, flip the
+toggle, and pick the control-line values (Styling / Structure / Context) that
+steer the model. Or edit the profile:
+
+```toml
+[post_process]
+enabled = true
+model = "s1-mini"          # catalog id
+styling = "semi-formal"    # casual | semi-casual | semi-formal | formal
+structure = "prose"        # prose | lists
+context = "general"        # general | email
+```
+
+Notes:
+
+- The model loads lazily on the first final transcript; restart `sttd` after
+  changing these settings.
+- Previews (the live overlay) stay raw — only committed text is normalized.
+- Failures never break dictation: if the model is missing or errors, the raw
+  transcript is committed and the problem is logged.
+- Empty output is valid (filler-only input normalizes to nothing).
+- Model files live under `~/.local/share/sttd/models/post-process/<id>/`.
+
 ## Configuration
 
 Path: **`~/.config/sttd/config.toml`**
@@ -142,6 +177,7 @@ See [`contrib/config.example.toml`](contrib/config.example.toml). Sections:
 
 - `[audio]` — sample rate, silence gap, channel capacity, `max_edit_seconds` (~5 min)
 - `[model]` — path/name, directory, `residency = "preload" | "lazy"`
+- `[post_process]` — text-normalization phase (`enabled`, catalog `model`, control line)
 - `[overlay]` — preview crossfade (~200 ms), edit buffer cap
 - `[injection]` — enable virtual-keyboard inject
 - `[tray]` — enable the StatusNotifierItem icon (defaults to on)
@@ -288,6 +324,8 @@ stt-wayland/
       audio.rs        # PipeWire stream
       vad.rs          # webrtc-vad chunker
       stt.rs          # audio.cpp worker thread
+      postprocess.rs  # text-normalization phase (S1-mini, candle)
+      postprocess/    # post-processing tests
       model_catalog.rs # pinned models + verified download/delete helpers
       state.rs        # state machine
       inject.rs       # virtual-keyboard

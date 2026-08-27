@@ -150,10 +150,7 @@ impl Form {
         model_controls.append(&model_action_button);
         model_picker.add_suffix(&model_controls);
 
-        let model_path = entry_row(
-            "File Path",
-            "Path to an audio.cpp GGUF model file",
-        );
+        let model_path = entry_row("File Path", "Path to an audio.cpp GGUF model file");
 
         let residency = string_combo(&RESIDENCIES);
         residency.set_title("Residency");
@@ -437,9 +434,8 @@ fn build_ui(app: &adw::Application) -> Result<()> {
 
     // ── Restart reminder, revealed after a profile is applied ────────
     let banner = adw::Banner::new("Restart sttd to use the applied profile.");
-    banner.set_button_label(Some("Got It"));
+    banner.set_button_label(Some("Restart"));
     banner.set_revealed(false);
-    banner.connect_button_clicked(|banner| banner.set_revealed(false));
     toolbar.add_top_bar(&banner);
 
     let profile_group = adw::PreferencesGroup::new();
@@ -634,6 +630,31 @@ fn build_ui(app: &adw::Application) -> Result<()> {
     let toast_overlay = adw::ToastOverlay::new();
     toast_overlay.set_child(Some(&toolbar));
     window.set_content(Some(&toast_overlay));
+
+    {
+        let overlay = toast_overlay.clone();
+        let banner = banner.clone();
+        banner.connect_button_clicked(move |banner| {
+            let output = std::process::Command::new("systemctl")
+                .args(["--user", "restart", "sttd"])
+                .stderr(std::process::Stdio::piped())
+                .output();
+            match output {
+                Ok(out) if out.status.success() => {
+                    toast(&overlay, "Restarted sttd.");
+                    banner.set_revealed(false);
+                }
+                Ok(out) => {
+                    let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    toast_error(&overlay, &format!("Could not restart sttd: {msg}"));
+                }
+                Err(e) => {
+                    toast_error(&overlay, &format!("Could not restart sttd: {e}"));
+                }
+            }
+        });
+    }
+
 
     connect_signals(
         &window,

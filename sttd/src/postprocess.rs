@@ -276,12 +276,31 @@ mod engine {
     }
 
     impl TextNormalizer {
+        /// Select the best compute device available at runtime.
+        ///
+        /// `cuda_if_available` / `metal_if_available` are always compiled into
+        /// candle-core; they fall back to `Ok(Device::Cpu)` when the backend
+        /// is absent, so we inspect the returned device before accepting it.
+        fn best_device() -> Result<Device> {
+            if let Ok(device) = Device::cuda_if_available(0) {
+                if device.is_cuda() {
+                    return Ok(device);
+                }
+            }
+            if let Ok(device) = Device::metal_if_available(0) {
+                if device.is_metal() {
+                    return Ok(device);
+                }
+            }
+            Ok(Device::Cpu)
+        }
+
         pub(super) fn load(gguf: &Path, tokenizer_json: &Path) -> Result<Self> {
             let start = std::time::Instant::now();
             let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_json).map_err(|error| {
                 anyhow::anyhow!("loading tokenizer {}: {error}", tokenizer_json.display())
             })?;
-            let device = Device::Cpu;
+            let device = Self::best_device()?;
             let mut file = std::fs::File::open(gguf)
                 .with_context(|| format!("opening model {}", gguf.display()))?;
             let content = gguf_file::Content::read(&mut file)
@@ -295,6 +314,7 @@ mod engine {
                 .collect();
             info!(
                 model = %gguf.display(),
+                device = ?device,
                 load_ms = start.elapsed().as_millis() as u64,
                 "post-process: normalizer ready"
             );

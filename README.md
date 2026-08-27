@@ -141,7 +141,7 @@ Final transcripts can pass through a local **text-normalization model** after
 recognition — punctuation and capitalization, spoken numbers/dates/emails
 written out, fillers ("um", "uh") removed. The first catalog model is
 **[S1-mini by Superwhisper](https://huggingface.co/superwhisper/s1-mini)**, a
-0.6B Qwen3 fine-tune (Q4_K_M GGUF, ~462 MiB) that runs on the CPU. Inference
+0.6B Qwen3 fine-tune (Q4_K_M GGUF, ~462 MiB) that runs locally. Inference
 uses [candle](https://github.com/huggingface/candle) in-process — no extra
 services — on the STT worker thread, so committed text ordering and
 backpressure are unchanged.
@@ -158,6 +158,25 @@ styling = "semi-formal"    # casual | semi-casual | semi-formal | formal
 structure = "prose"        # prose | lists
 context = "general"        # general | email
 ```
+
+Compute backend: the normalizer runs on **CPU by default**. At startup it
+probes for a CUDA device, then Metal, then falls back to CPU — but the GPU
+backends must be compiled in via cargo feature flags when building `sttd`:
+
+```bash
+# CPU (default, no extra flags)
+cargo build --workspace
+
+# NVIDIA CUDA (requires nvidia driver + CUDA toolkit at build time)
+cargo build --workspace --features sttd/post-process-cuda
+
+# Apple Metal (macOS only)
+cargo build --workspace --features sttd/post-process-metal
+```
+
+The active device is printed in the log line
+`post-process: normalizer ready` (`device=Cpu` / `device=Cuda(...)` /
+`device=Metal(...)`).
 
 Notes:
 

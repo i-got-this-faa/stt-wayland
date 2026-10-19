@@ -27,6 +27,7 @@ use gtk4::{gio, glib};
 
 use config::{
     default_models_dir, Config, ModelResidency, OverlayAnchor, PostProcessConfig, ProfileStore,
+    PIPELINE_SAMPLE_RATE_HZ,
 };
 use model_catalog::{
     delete_managed_model, delete_post_process_model, download_model, download_post_process_model,
@@ -113,8 +114,6 @@ struct Form {
     residency: adw::ComboRow,
     threads: adw::SpinRow,
     language: adw::EntryRow,
-    sample_rate: adw::SpinRow,
-    channels: adw::SpinRow,
     vad_silence_ms: adw::SpinRow,
     max_edit_seconds: adw::SpinRow,
     stt_channel_capacity: adw::SpinRow,
@@ -164,7 +163,10 @@ impl Form {
         model_controls.append(&model_action_button);
         model_picker.add_suffix(&model_controls);
 
-        let model_path = entry_row("File Path", "Path to an audio.cpp GGUF model file");
+        let model_path = entry_row(
+            "Model File",
+            "Path to a local audio.cpp GGUF file (advanced; managed models are selected above)",
+        );
 
         let residency = string_combo(&RESIDENCIES);
         residency.set_title("Residency");
@@ -176,20 +178,6 @@ impl Form {
             "Language or locale hint such as \"en\" or \"en-US\" (auto = detect)",
         );
 
-        let sample_rate = spin_row(
-            "Sample Rate",
-            "Capture rate in Hz - speech models expect 16000",
-            8_000.0,
-            96_000.0,
-            1_000.0,
-        );
-        let channels = spin_row(
-            "Channels",
-            "Captured audio channels (1 = mono)",
-            1.0,
-            8.0,
-            1.0,
-        );
         let vad_silence_ms = spin_row(
             "VAD Silence Gap",
             "Silence in milliseconds that ends a speech chunk",
@@ -212,8 +200,8 @@ impl Form {
             1.0,
         );
         let node_name = entry_row(
-            "PipeWire Node",
-            "Optional PipeWire target node name (empty = default source)",
+            "Input Device",
+            "Optional input device name (empty = system default). On Linux, use `pw-cli ls Node` to list PipeWire nodes.",
         );
 
         let overlay_enabled = switch_row("Enable Overlay", "Show the live transcription card");
@@ -241,12 +229,12 @@ impl Form {
             "Type transcriptions into the focused window",
         );
         let batch_mode = switch_row(
-            "Batch Committed Text",
-            "Inject committed text at once instead of per keystroke",
+            "Instant Input",
+            "Type committed text without a per-character delay",
         );
         let char_delay_ms = spin_row(
             "Character Delay",
-            "Delay between injected characters in milliseconds",
+            "Delay between injected characters when Instant Input is off",
             0.0,
             1_000.0,
             1.0,
@@ -321,8 +309,6 @@ impl Form {
             residency,
             threads,
             language,
-            sample_rate,
-            channels,
             vad_silence_ms,
             max_edit_seconds,
             stt_channel_capacity,
@@ -343,6 +329,28 @@ impl Form {
             pp_structure,
             pp_context,
         }
+    }
+}
+
+/// Restores the previous guard value on drop, so nested refreshes cannot
+/// accidentally re-enable signal handlers for an outer update.
+struct UpdatingGuard<'a> {
+    cell: &'a Cell<bool>,
+    previous: bool,
+}
+
+impl<'a> UpdatingGuard<'a> {
+    fn new(form: &'a Form) -> Self {
+        Self {
+            cell: &form.updating,
+            previous: form.updating.replace(true),
+        }
+    }
+}
+
+impl Drop for UpdatingGuard<'_> {
+    fn drop(&mut self) {
+        self.cell.set(self.previous);
     }
 }
 
@@ -412,49 +420,32 @@ const SETTINGS_SECTIONS: [SettingsSection; 4] = [
     },
 ];
 
-/// Builds a responsive two-column settings destination.
+/// Builds a single-column settings page with a centered, readable width.
 fn settings_page(
     section: &SettingsSection,
     groups: &[&adw::PreferencesGroup],
 ) -> gtk4::ScrolledWindow {
-    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 28);
-    content.set_margin_top(40);
-    content.set_margin_bottom(48);
-    content.set_margin_start(32);
-    content.set_margin_end(32);
+    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 18);
+    content.set_margin_top(28);
+    content.set_margin_bottom(40);
+    content.set_margin_start(24);
+    content.set_margin_end(24);
     content.set_valign(gtk4::Align::Start);
 
-    let heading = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-    let title = gtk4::Label::new(Some(section.title));
-    title.set_xalign(0.0);
-    title.add_css_class("title-1");
     let description = gtk4::Label::new(Some(section.description));
     description.set_xalign(0.0);
     description.set_wrap(true);
     description.add_css_class("dim-label");
-    heading.append(&title);
-    heading.append(&description);
-    content.append(&heading);
+    content.append(&description);
 
-    let group_grid = gtk4::FlowBox::builder()
-        .column_spacing(24)
-        .row_spacing(24)
-        .min_children_per_line(1)
-        .max_children_per_line(2)
-        .homogeneous(true)
-        .selection_mode(gtk4::SelectionMode::None)
-        .hexpand(true)
-        .build();
     for group in groups {
-        group.set_size_request(460, -1);
         group.set_hexpand(true);
-        group_grid.append(*group);
+        content.append(*group);
     }
-    content.append(&group_grid);
 
     let clamp = adw::Clamp::builder()
-        .maximum_size(1180)
-        .tightening_threshold(960)
+        .maximum_size(720)
+        .tightening_threshold(560)
         .child(&content)
         .build();
     gtk4::ScrolledWindow::builder()
@@ -495,7 +486,7 @@ fn build_ui(app: &adw::Application) -> Result<()> {
 
     // ── Header bar: window title plus the primary actions ────────────
     let header = adw::HeaderBar::new();
-    let window_title = adw::WindowTitle::new("Settings", "Speech");
+    let window_title = adw::WindowTitle::new("Speech", "");
     header.set_title_widget(Some(&window_title));
 
     let sidebar_button = gtk4::Button::from_icon_name("view-list-symbolic");
@@ -542,6 +533,7 @@ fn build_ui(app: &adw::Application) -> Result<()> {
         "Models are downloaded into the app data directory and verified before installation.",
     ));
     model_group.add(&form.model_picker);
+    model_group.add(&form.model_path);
     model_group.add(&form.residency);
 
     let pp_model_group = adw::PreferencesGroup::new();
@@ -570,10 +562,14 @@ fn build_ui(app: &adw::Application) -> Result<()> {
     let capture_group = adw::PreferencesGroup::new();
     capture_group.set_title("Capture");
     capture_group.set_description(Some(
-        "Choose the PipeWire source and captured audio format.",
+        "Choose the input source. Leave Input Device empty for the system default; capture is always converted to mono 16 kHz for the speech pipeline.",
     ));
-    capture_group.add(&form.sample_rate);
-    capture_group.add(&form.channels);
+    let format_row = adw::ActionRow::builder()
+        .title("Capture Format")
+        .subtitle("Mono, 16 kHz")
+        .build();
+    format_row.set_activatable(false);
+    capture_group.add(&format_row);
     capture_group.add(&form.node_name);
 
     let detection_group = adw::PreferencesGroup::new();
@@ -663,16 +659,16 @@ fn build_ui(app: &adw::Application) -> Result<()> {
     sidebar.set_size_request(280, -1);
     sidebar.add_css_class("sidebar");
     sidebar.append(&brand);
+    profile_group.set_margin_top(0);
+    profile_group.set_margin_bottom(12);
+    profile_group.set_margin_start(12);
+    profile_group.set_margin_end(12);
+    sidebar.append(&profile_group);
+    sidebar.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
     sidebar.append(&navigation);
     let sidebar_spacer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     sidebar_spacer.set_vexpand(true);
     sidebar.append(&sidebar_spacer);
-    sidebar.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-    profile_group.set_margin_top(12);
-    profile_group.set_margin_bottom(16);
-    profile_group.set_margin_start(12);
-    profile_group.set_margin_end(12);
-    sidebar.append(&profile_group);
 
     let split_view = adw::OverlaySplitView::builder()
         .sidebar(&sidebar)
@@ -717,7 +713,7 @@ fn build_ui(app: &adw::Application) -> Result<()> {
                 return;
             };
             stack.set_visible_child_name(section.name);
-            window_title.set_subtitle(section.title);
+            window_title.set_title(section.title);
             if split_view.is_collapsed() {
                 split_view.set_show_sidebar(false);
             }
@@ -755,7 +751,6 @@ fn build_ui(app: &adw::Application) -> Result<()> {
         });
     }
 
-
     connect_signals(
         &window,
         &toast_overlay,
@@ -787,6 +782,7 @@ fn connect_signals(
 ) {
     // Selecting a profile loads it into the form.
     {
+        let window = window.clone();
         let form = Rc::clone(form);
         let state = Rc::clone(state);
         let overlay = overlay.clone();
@@ -802,7 +798,7 @@ fn connect_signals(
             else {
                 return;
             };
-            load_profile(&form, &state, &overlay, &name);
+            request_profile_switch(&window, &form, &state, &overlay, &name);
         });
     }
 
@@ -820,13 +816,15 @@ fn connect_signals(
             match choice {
                 Some(ModelChoice::Catalog(spec)) => {
                     if let Some(path) = managed_model_path(&default_models_dir(), spec) {
-                        if install_state(&default_models_dir(), spec) == InstallState::Installed {
-                            let text = path.to_string_lossy().into_owned();
-                            if form.model_path.text().as_str() != text {
-                                form.model_path.set_text(&text);
-                            }
-                            form.language.set_text(spec.default_language);
+                        let text = path.to_string_lossy().into_owned();
+                        if form.model_path.text().as_str() != text {
+                            form.model_path.set_text(&text);
                         }
+                    }
+                    // Fill the language hint only when the user has not set
+                    // one; changing models must not silently rewrite it.
+                    if form.language.text().trim().is_empty() {
+                        form.language.set_text(spec.default_language);
                     }
                 }
                 Some(ModelChoice::Custom(path)) => {
@@ -905,8 +903,24 @@ fn connect_signals(
             if form.updating.get() {
                 return;
             }
+            sync_pp_controls(&form);
             update_pp_model_manager(&form);
         });
+    }
+    {
+        let form = Rc::clone(form);
+        let toggle = form.injection_enabled.clone();
+        toggle.connect_active_notify(move |_| sync_injection_controls(&form));
+    }
+    {
+        let form = Rc::clone(form);
+        let toggle = form.batch_mode.clone();
+        toggle.connect_active_notify(move |_| sync_injection_controls(&form));
+    }
+    {
+        let form = Rc::clone(form);
+        let toggle = form.overlay_enabled.clone();
+        toggle.connect_active_notify(move |_| sync_overlay_controls(&form));
     }
 
     {
@@ -1107,7 +1121,7 @@ fn confirm_delete_profile(
     let heading = format!("Delete Profile '{name}'?");
     let dialog = adw::AlertDialog::new(
         Some(heading.as_str()),
-        Some("This permanently removes the profile from disk."),
+        Some("This permanently removes the profile from disk. Unsaved edits to it are lost."),
     );
     dialog.add_response("cancel", "Cancel");
     dialog.add_response("delete", "Delete");
@@ -1153,6 +1167,92 @@ fn confirm_delete_profile(
     dialog.present(Some(window));
 }
 
+fn has_unsaved_changes(state: &Rc<RefCell<EditorState>>, form: &Form) -> bool {
+    let edited = collect_config(state, form);
+    let saved = state.borrow().config.clone();
+    match (toml::to_string(&edited), toml::to_string(&saved)) {
+        (Ok(edited), Ok(saved)) => edited != saved,
+        _ => true,
+    }
+}
+
+fn revert_profile_selection(form: &Form, state: &Rc<RefCell<EditorState>>) {
+    let current = state.borrow().current.clone();
+    let store = state.borrow().store.clone();
+    let Ok(names) = store.list() else {
+        return;
+    };
+    let Some(index) = names.iter().position(|name| name == &current) else {
+        return;
+    };
+    let _guard = UpdatingGuard::new(form);
+    form.profiles.set_selected(index as u32);
+}
+
+fn save_current_config(form: &Rc<Form>, state: &Rc<RefCell<EditorState>>) -> Result<()> {
+    let name = state.borrow().current.clone();
+    let cfg = collect_config(state, form);
+    let store = state.borrow().store.clone();
+    store.save(&name, &cfg)?;
+    state.borrow_mut().config = cfg;
+    Ok(())
+}
+
+fn request_profile_switch(
+    window: &adw::ApplicationWindow,
+    form: &Rc<Form>,
+    state: &Rc<RefCell<EditorState>>,
+    overlay: &adw::ToastOverlay,
+    name: &str,
+) {
+    let current = state.borrow().current.clone();
+    if name == current {
+        return;
+    }
+
+    if !has_unsaved_changes(state, form) {
+        load_profile(form, state, overlay, name);
+        return;
+    }
+
+    let dialog = adw::AlertDialog::new(
+        Some("Unsaved Changes"),
+        Some(&format!(
+            "Save the changes to '{current}' before switching to '{name}'?"
+        )),
+    );
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("discard", "Discard");
+    dialog.add_response("save", "Save");
+    dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
+    dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("save"));
+    dialog.set_close_response("cancel");
+
+    let form = Rc::clone(form);
+    let state = Rc::clone(state);
+    let overlay = overlay.clone();
+    let name = name.to_string();
+    dialog.connect_response(None, move |_, response| match response {
+        "save" => {
+            if !selected_model_is_ready(&form, &overlay) {
+                revert_profile_selection(&form, &state);
+                return;
+            }
+            match save_current_config(&form, &state) {
+                Ok(()) => load_profile(&form, &state, &overlay, &name),
+                Err(error) => {
+                    toast_error(&overlay, &format!("Could not save profile: {error:#}"));
+                    revert_profile_selection(&form, &state);
+                }
+            }
+        }
+        "discard" => load_profile(&form, &state, &overlay, &name),
+        _ => revert_profile_selection(&form, &state),
+    });
+    dialog.present(Some(window));
+}
+
 fn load_profile(
     form: &Rc<Form>,
     state: &Rc<RefCell<EditorState>>,
@@ -1193,7 +1293,7 @@ fn refresh_profiles(form: &Rc<Form>, state: &Rc<RefCell<EditorState>>) {
         }
     };
 
-    form.updating.set(true);
+    let _guard = UpdatingGuard::new(form);
     let model = gtk4::StringList::new(&[]);
     for name in &names {
         model.append(name);
@@ -1208,7 +1308,6 @@ fn refresh_profiles(form: &Rc<Form>, state: &Rc<RefCell<EditorState>>) {
             state.borrow_mut().current = fallback.clone();
         }
     }
-    form.updating.set(false);
 
     form.profiles.set_subtitle(
         &active
@@ -1242,7 +1341,8 @@ fn refresh_models(form: &Form, cfg: &Config) {
         custom_paths.insert(current_path.clone());
     }
 
-    form.updating.set(true);
+    let _guard = UpdatingGuard::new(form);
+    form.model_path.set_text(&current);
     let model = gtk4::StringList::new(&[]);
     let mut choices = Vec::with_capacity(MODEL_CATALOG.len() + custom_paths.len());
     for spec in MODEL_CATALOG {
@@ -1277,7 +1377,7 @@ fn refresh_models(form: &Form, cfg: &Config) {
         })
         .map_or(gtk4::INVALID_LIST_POSITION, |index| index as u32);
     form.model_picker.set_selected(selected);
-    form.updating.set(false);
+    drop(_guard);
     update_model_manager(form);
 }
 
@@ -1377,11 +1477,23 @@ fn selected_model_is_ready(form: &Form, overlay: &adw::ToastOverlay) -> bool {
             false
         }
         None => {
-            toast_error(
-                overlay,
-                "Select an installed model before saving this profile.",
-            );
-            false
+            let typed = form.model_path.text();
+            let path = Path::new(typed.trim());
+            if !typed.trim().is_empty() && path.is_file() {
+                true
+            } else if typed.trim().is_empty() {
+                toast_error(
+                    overlay,
+                    "Select an installed model or enter a model file path before saving this profile.",
+                );
+                false
+            } else {
+                toast_error(
+                    overlay,
+                    "The model file path does not point to an existing file.",
+                );
+                false
+            }
         }
     }
 }
@@ -1448,9 +1560,22 @@ fn update_model_manager(form: &Form) {
             form.model_action_button.set_visible(false);
         }
         None => {
-            form.model_picker
-                .set_subtitle("Select an installed model or one to download");
-            form.model_picker.set_tooltip_text(None);
+            let typed = form.model_path.text();
+            let path = Path::new(typed.trim());
+            if typed.trim().is_empty() {
+                form.model_picker
+                    .set_subtitle("Select an installed model or one to download");
+                form.model_picker.set_tooltip_text(None);
+            } else {
+                let status = if path.is_file() {
+                    "Installed"
+                } else {
+                    "Missing"
+                };
+                form.model_picker
+                    .set_subtitle(&format!("Custom local model | {status}"));
+                form.model_picker.set_tooltip_text(Some(typed.as_str()));
+            }
             form.model_action_button.set_visible(false);
         }
     }
@@ -1564,7 +1689,6 @@ fn start_model_download(
                 match result {
                     Ok(path) => {
                         form.model_path.set_text(path.to_string_lossy().as_ref());
-                        form.language.set_text(spec.default_language);
                         let mut cfg = state.borrow().config.clone();
                         cfg.model.path = path.to_string_lossy().into_owned();
                         refresh_models(&form, &cfg);
@@ -1672,7 +1796,9 @@ fn confirm_delete_model(
                         if let Some(candidate) = MODEL_CATALOG.iter().find(|candidate| {
                             managed_model_path(&models_dir, candidate).as_ref() == Some(&path)
                         }) {
-                            form.language.set_text(candidate.default_language);
+                            if form.language.text().trim().is_empty() {
+                                form.language.set_text(candidate.default_language);
+                            }
                         }
                     } else {
                         form.model_path.set_text("");
@@ -1709,7 +1835,7 @@ fn profiles_using_model(state: &Rc<RefCell<EditorState>>, target: &Path) -> Resu
 // ─── Post-processing model management ───────────────────────────────────────
 
 fn refresh_pp_models(form: &Form, cfg: &Config) {
-    form.updating.set(true);
+    let guard = UpdatingGuard::new(form);
     let models_dir = default_models_dir();
     let list = gtk4::StringList::new(&[]);
     let mut choices = Vec::with_capacity(POST_PROCESS_CATALOG.len());
@@ -1730,7 +1856,7 @@ fn refresh_pp_models(form: &Form, cfg: &Config) {
         .position(|spec| spec.id == cfg.post_process.model)
         .map_or(gtk4::INVALID_LIST_POSITION, |index| index as u32);
     form.pp_model_picker.set_selected(selected);
-    form.updating.set(false);
+    drop(guard);
     update_pp_model_manager(form);
 }
 
@@ -1925,7 +2051,6 @@ fn start_pp_model_download(
                     Ok(_gguf_path) => {
                         let mut cfg = state.borrow().config.clone();
                         cfg.post_process.model = spec.id.to_string();
-                        state.borrow_mut().config = cfg.clone();
                         refresh_pp_models(&form, &cfg);
                         toast(&overlay, &format!("Installed {}.", spec.name));
                     }
@@ -2040,9 +2165,33 @@ fn profiles_using_pp_model(
     Ok(profiles)
 }
 
+fn sync_injection_controls(form: &Form) {
+    let enabled = form.injection_enabled.is_active();
+    form.batch_mode.set_sensitive(enabled);
+    form.char_delay_ms
+        .set_sensitive(enabled && !form.batch_mode.is_active());
+}
+
+fn sync_overlay_controls(form: &Form) {
+    let enabled = form.overlay_enabled.is_active();
+    form.overlay_anchor.set_sensitive(enabled);
+    form.overlay_margin.set_sensitive(enabled);
+    form.crossfade_ms.set_sensitive(enabled);
+}
+
+fn sync_pp_controls(form: &Form) {
+    let enabled = form.pp_enabled.is_active();
+    form.pp_styling.set_sensitive(enabled);
+    form.pp_structure.set_sensitive(enabled);
+    form.pp_context.set_sensitive(enabled);
+}
+
 fn collect_config(state: &Rc<RefCell<EditorState>>, form: &Form) -> Config {
     let mut cfg = state.borrow().config.clone();
-    cfg.model.path = form.model_path.text().to_string();
+    let selected_path = selected_model_choice(form)
+        .and_then(|choice| choice.path())
+        .map(|path| path.to_string_lossy().into_owned());
+    cfg.model.path = selected_path.unwrap_or_else(|| form.model_path.text().trim().to_string());
     if let Some(name) = Path::new(&cfg.model.path).file_name() {
         cfg.model.name = name.to_string_lossy().into_owned();
     }
@@ -2054,8 +2203,10 @@ fn collect_config(state: &Rc<RefCell<EditorState>>, form: &Form) -> Config {
     cfg.model.threads = spin_u32(&form.threads);
     cfg.model.language = form.language.text().to_string();
 
-    cfg.audio.sample_rate = spin_u32(&form.sample_rate);
-    cfg.audio.channels = spin_u32(&form.channels) as u16;
+    // Capture is normalized to the pipeline format; these fields are kept in
+    // the profile for TOML compatibility, not exposed as user controls.
+    cfg.audio.sample_rate = PIPELINE_SAMPLE_RATE_HZ;
+    cfg.audio.channels = 1;
     cfg.audio.vad_silence_ms = spin_u32(&form.vad_silence_ms);
     cfg.audio.silence_gap_ms = cfg.audio.vad_silence_ms;
     cfg.audio.max_edit_seconds = spin_u32(&form.max_edit_seconds);
@@ -2108,7 +2259,7 @@ fn collect_config(state: &Rc<RefCell<EditorState>>, form: &Form) -> Config {
 }
 
 fn populate_form(form: &Form, cfg: &Config) {
-    form.updating.set(true);
+    let guard = UpdatingGuard::new(form);
     form.model_path.set_text(&cfg.model.path);
     form.residency.set_selected(match cfg.model.residency {
         ModelResidency::Preload => 0,
@@ -2117,8 +2268,6 @@ fn populate_form(form: &Form, cfg: &Config) {
     form.threads.set_value(cfg.model.threads as f64);
     form.language.set_text(&cfg.model.language);
 
-    form.sample_rate.set_value(cfg.audio.sample_rate as f64);
-    form.channels.set_value(cfg.audio.channels as f64);
     form.vad_silence_ms
         .set_value(cfg.audio.vad_silence_ms as f64);
     form.max_edit_seconds
@@ -2161,7 +2310,10 @@ fn populate_form(form: &Form, cfg: &Config) {
         &cfg.post_process.context,
     ));
     refresh_pp_models(form, cfg);
-    form.updating.set(false);
+    drop(guard);
+    sync_injection_controls(form);
+    sync_overlay_controls(form);
+    sync_pp_controls(form);
 }
 
 fn spin_u32(spin: &adw::SpinRow) -> u32 {

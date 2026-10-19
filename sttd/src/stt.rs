@@ -45,10 +45,7 @@ use crate::config::{ModelConfig, ModelResidency, PostProcessConfig};
 use crate::postprocess::PostProcessor;
 
 /// Speech engine + webrtc-vad capture rate (mono f32).
-pub const SAMPLE_RATE_HZ: u32 = 16_000;
-
-/// Default Live-mode audio overlap for chunk continuity (~200 ms @ 16 kHz).
-pub const DEFAULT_OVERLAP_MS: u32 = 200;
+pub const SAMPLE_RATE_HZ: u32 = crate::config::PIPELINE_SAMPLE_RATE_HZ;
 
 /// Default bounded channel capacity when not taken from config.
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 8;
@@ -79,7 +76,7 @@ pub enum SttCommand {
     EnsureLoaded { reply: mpsc::Sender<Result<()>> },
     /// Reply after every command queued before this barrier has completed.
     Barrier { reply: mpsc::Sender<()> },
-    /// Clear Live overlap tail + prompt state (e.g. between Stop → Start).
+    /// Clear Live prompt state (e.g. between Stop → Start).
     ResetSession { session_id: u64 },
     /// Stop the worker loop and drop the model.
     Shutdown,
@@ -103,35 +100,28 @@ pub struct SttEngine {
 }
 
 impl SttEngine {
-    /// Spawn the worker with default channel capacity and overlap.
+    /// Spawn the worker with default channel capacity.
     ///
     /// With `ModelResidency::Preload`, blocks until the model is loaded (or
     /// returns a clear error if the file is missing / unloadable).
     pub fn new(cfg: &ModelConfig, post_process: &PostProcessConfig) -> Result<Self> {
-        Self::spawn(cfg, post_process, DEFAULT_CHANNEL_CAPACITY, DEFAULT_OVERLAP_MS)
+        Self::spawn(cfg, post_process, DEFAULT_CHANNEL_CAPACITY)
     }
 
     /// Spawn the worker thread.
     ///
     /// * `channel_capacity` — bound for command + result channels (backpressure).
-    /// * `overlap_ms` — Live-mode audio tail kept from the previous chunk.
     /// * `post_process` — optional text-normalization phase applied to final
     ///   transcripts inside the worker (keeps commit ordering intact).
     pub fn spawn(
         cfg: &ModelConfig,
         post_process: &PostProcessConfig,
         channel_capacity: usize,
-        overlap_ms: u32,
     ) -> Result<Self> {
         let model_path = cfg.model_path();
         let capacity = channel_capacity.max(1);
-        let overlap_samples = ms_to_samples(overlap_ms, SAMPLE_RATE_HZ);
         let threads = resolve_threads(cfg.threads);
-        let language = if cfg.language.is_empty() {
-            "en".to_string()
-        } else {
-            cfg.language.clone()
-        };
+        let language = cfg.language.clone();
         let residency = cfg.residency;
         let loaded = Arc::new(AtomicBool::new(false));
         let preview_cancel = Arc::new(AtomicBool::new(false));
@@ -140,7 +130,6 @@ impl SttEngine {
             path = %model_path.display(),
             residency = ?residency,
             capacity,
-            overlap_ms,
             threads,
             language = %language,
             "stt: spawning worker thread"
@@ -161,7 +150,6 @@ impl SttEngine {
             residency,
             threads,
             language,
-            overlap_samples,
             preload: residency == ModelResidency::Preload,
             loaded: Arc::clone(&loaded),
             preview_cancel: Arc::clone(&preview_cancel),
@@ -281,7 +269,7 @@ impl SttEngine {
         Ok(self.transcribe_full(samples.to_vec())?.text)
     }
 
-    /// Clear Live overlap + prompt continuity (call on Stop / mode switch).
+    /// Clear Live prompt continuity (call on Stop / mode switch).
     pub fn reset_session(&self) -> Result<u64> {
         let session_id = self
             .session_id
@@ -364,7 +352,6 @@ struct WorkerConfig {
     residency: ModelResidency,
     threads: i32,
     language: String,
-    overlap_samples: usize,
     preload: bool,
     loaded: Arc<AtomicBool>,
     preview_cancel: Arc<AtomicBool>,
@@ -530,8 +517,6 @@ fn send_result(
 struct SttWorker {
     cfg: WorkerConfig,
     session_id: u64,
-    /// Tail of the last Live chunk, prepended to the next for continuity.
-    overlap_tail: Vec<f32>,
     /// Engine handles. Dropping order matters: the session borrows the model in
     /// the C ABI, and the model borrows the registry. Fields drop in
     /// declaration order, so `session` is declared first.
@@ -548,7 +533,6 @@ impl SttWorker {
         Self {
             cfg,
             session_id: 0,
-            overlap_tail: Vec::new(),
             #[cfg(feature = "stt-engine")]
             session: None,
             #[cfg(feature = "stt-engine")]
@@ -559,7 +543,6 @@ impl SttWorker {
     }
 
     fn clear_session(&mut self) {
-        self.overlap_tail.clear();
         debug!("stt worker: session reset");
     }
 
@@ -664,7 +647,12 @@ impl SttWorker {
         }
     }
 
-    /// Live path with optional short overlap from the previous chunk.
+    /// Live path: transcribe each VAD-closed utterance independently.
+    ///
+    /// No audio is carried over from the previous chunk. VAD closes at a
+    /// silence gap, so overlap is unnecessary; prepending a tail here would
+    /// make the model emit those words twice because chunk transcripts are
+    /// committed verbatim rather than text-stitched.
     fn transcribe_live(&mut self, samples: Vec<f32>, is_final: bool) -> Result<TranscriptResult> {
         if samples.is_empty() {
             return Ok(TranscriptResult {
@@ -676,11 +664,7 @@ impl SttWorker {
 
         self.ensure_loaded()?;
 
-        let mut pcm = Vec::with_capacity(self.overlap_tail.len() + samples.len());
-        pcm.extend_from_slice(&self.overlap_tail);
-        pcm.extend_from_slice(&samples);
-
-        let text = self.run_transcription(&pcm)?;
+        let text = self.run_transcription(&samples)?;
 
         // Post-processing phase: normalize committed text only. Previews stay
         // raw so the overlay keeps its low latency.
@@ -690,31 +674,12 @@ impl SttWorker {
             text
         };
 
-        if is_final {
-            // Keep only the tail of the committed chunk. Preview jobs are
-            // snapshots of the current utterance; updating the overlap from
-            // them would duplicate the preview tail in the eventual final
-            // chunk.
-            let n = self.cfg.overlap_samples.min(samples.len());
-            if n > 0 {
-                self.overlap_tail = samples[samples.len() - n..].to_vec();
-            } else {
-                self.overlap_tail.clear();
-            }
-
-            debug!(
-                n_samples = samples.len(),
-                n_with_overlap = pcm.len(),
-                chars = text.len(),
-                "stt worker: live final"
-            );
-        } else {
-            debug!(
-                n_samples = samples.len(),
-                chars = text.len(),
-                "stt worker: live preview"
-            );
-        }
+        debug!(
+            n_samples = samples.len(),
+            is_final,
+            chars = text.len(),
+            "stt worker: live transcription"
+        );
 
         Ok(TranscriptResult {
             text,
@@ -723,7 +688,7 @@ impl SttWorker {
         })
     }
 
-    /// Edit path: single full-buffer pass, no live overlap.
+    /// Edit path: single full-buffer pass.
     fn transcribe_edit(&mut self, samples: Vec<f32>) -> Result<TranscriptResult> {
         if samples.is_empty() {
             return Ok(TranscriptResult {
@@ -781,10 +746,6 @@ impl SttWorker {
 
 // --- helpers ------------------------------------------------------------------
 
-fn ms_to_samples(ms: u32, sample_rate: u32) -> usize {
-    (u64::from(ms) * u64::from(sample_rate) / 1000) as usize
-}
-
 fn resolve_threads(configured: u32) -> i32 {
     if configured > 0 {
         return configured as i32;
@@ -825,11 +786,6 @@ fn model_family_for_filename(filename: &str) -> Option<audio_cpp::ModelFamily> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ms_to_samples_200ms() {
-        assert_eq!(ms_to_samples(200, 16_000), 3_200);
-    }
 
     #[test]
     fn collapse_whitespace() {

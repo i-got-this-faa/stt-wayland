@@ -24,7 +24,7 @@ stt-engine = ["dep:audio-cpp", "dep:webrtc-vad"]
 overlay = ["dep:gtk4", "dep:gtk4-layer-shell", "dep:glib"]
 inject = ["dep:wayland-client", "dep:wayland-protocols", "dep:wayland-protocols-misc"]
 tray = ["dep:ksni", "dep:resvg"]
-settings = ["dep:gtk4", "dep:adw", "dep:sha2"]
+settings = ["dep:gtk4", "dep:adw"]
 # Post-processing GPU backend selection. The default build runs on CPU; enable
 # one of these features at build time for GPU acceleration (they add candle-core's
 # CUDA / Metal backends, which need a matching GPU driver/toolkit to link):
@@ -32,7 +32,7 @@ settings = ["dep:gtk4", "dep:adw", "dep:sha2"]
 #   --features 'post-process-metal'  (Apple Metal, macOS only)
 # At runtime the engine picks CUDA, then Metal, then CPU — whichever the binary
 # was compiled with and has available.
-post-process = ["dep:candle-core", "dep:candle-transformers", "dep:tokenizers", "dep:sha2"]
+post-process = ["dep:candle-core", "dep:candle-transformers", "dep:tokenizers"]
 post-process-cuda = ["post-process", "candle-core/cuda"]
 post-process-metal = ["post-process", "candle-core/metal"]
 
@@ -50,7 +50,7 @@ tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 libc = { workspace = true }
 ureq = { workspace = true }
-sha2 = { workspace = true, optional = true }
+sha2 = { workspace = true }
 
 # Optional system-backed crates (enabled by default features)
 pipewire = { workspace = true, optional = true }

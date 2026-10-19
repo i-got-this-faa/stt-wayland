@@ -22,6 +22,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+/// Capture rate required by the VAD, preview, and ASR pipeline.
+///
+/// Capture backends may deliver another native rate; they resample to this
+/// value before samples enter the daemon.
+pub const PIPELINE_SAMPLE_RATE_HZ: u32 = 16_000;
+
 // ─── Top-level ──────────────────────────────────────────────────────────────
 
 /// Top-level daemon configuration.
@@ -56,7 +62,8 @@ impl Default for Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioConfig {
-    /// Capture sample rate (Hz). Whisper + webrtc-vad expect 16_000.
+    /// Capture sample rate (Hz). Kept for TOML compatibility; normalization
+    /// always pins this to [`PIPELINE_SAMPLE_RATE_HZ`].
     pub sample_rate: u32,
 
     /// VAD silence gap that closes a speech chunk (milliseconds).
@@ -67,7 +74,8 @@ pub struct AudioConfig {
     /// Max edit-mode buffer duration in seconds (default 300 ≈ 5 minutes).
     pub max_edit_seconds: u32,
 
-    /// Number of channels (mono).
+    /// Number of capture channels. Kept for TOML compatibility; the pipeline
+    /// always downmixes to mono during normalization.
     pub channels: u16,
 
     /// Bounded mpsc capacity (number of `Vec<f32>` chunks) for STT backpressure.
@@ -396,6 +404,16 @@ impl Config {
         // Sync legacy audio field used by `vad` module.
         self.audio.silence_gap_ms = self.audio.vad_silence_ms;
 
+        // The VAD and every ASR backend operate on mono 16 kHz PCM. Hand-edited
+        // or legacy configs may still contain another rate/channel count; pin
+        // them here instead of feeding mislabeled samples to the pipeline.
+        self.audio.sample_rate = PIPELINE_SAMPLE_RATE_HZ;
+        self.audio.channels = 1;
+        self.audio.vad_silence_ms = self.audio.vad_silence_ms.clamp(50, 10_000);
+        self.audio.silence_gap_ms = self.audio.vad_silence_ms;
+        self.audio.max_edit_seconds = self.audio.max_edit_seconds.max(1);
+        self.audio.stt_channel_capacity = self.audio.stt_channel_capacity.clamp(1, 256);
+
         // Sync legacy overlay crossfade field used by `overlay` module.
         self.overlay.preview_crossfade_ms = self.overlay.crossfade_ms;
 
@@ -692,6 +710,25 @@ mod tests {
         assert_eq!(cfg.overlay.edit_buffer_cap_secs, 300);
         assert!(cfg.injection.batch_mode);
         assert!(cfg.tray.enabled);
+    }
+
+    #[test]
+    fn normalize_forces_pipeline_audio_format() {
+        let mut cfg = Config::default();
+        cfg.audio.sample_rate = 48_000;
+        cfg.audio.channels = 2;
+        cfg.audio.vad_silence_ms = 0;
+        cfg.audio.max_edit_seconds = 0;
+        cfg.audio.stt_channel_capacity = 0;
+
+        cfg.normalize();
+
+        assert_eq!(cfg.audio.sample_rate, PIPELINE_SAMPLE_RATE_HZ);
+        assert_eq!(cfg.audio.channels, 1);
+        assert_eq!(cfg.audio.vad_silence_ms, 50);
+        assert_eq!(cfg.audio.silence_gap_ms, 50);
+        assert_eq!(cfg.audio.max_edit_seconds, 1);
+        assert_eq!(cfg.audio.stt_channel_capacity, 1);
     }
 
     #[test]

@@ -53,7 +53,7 @@ use crate::config::AudioConfig;
 // ---------------------------------------------------------------------------
 
 /// Capture / VAD sample rate expected by this module.
-pub const SAMPLE_RATE_HZ: u32 = 16_000;
+pub const SAMPLE_RATE_HZ: u32 = crate::config::PIPELINE_SAMPLE_RATE_HZ;
 
 /// 10 ms frame at 16 kHz — default webrtc-vad frame length.
 pub const FRAME_SAMPLES_10MS: usize = 160;

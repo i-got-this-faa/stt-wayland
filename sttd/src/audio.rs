@@ -1,9 +1,13 @@
 //! PipeWire audio capture for `sttd`.
 //!
-//! Mono **16 kHz f32** (config-driven rate/channels). The stream is opened on
+//! Mono **16 kHz f32**. The stream is opened on
 //! [`AudioCapture::start`] and closed on [`AudioCapture::stop`].
 //! [`AudioCapture::set_feeding`] (Pause/Resume) stops pushing samples without
 //! tearing the PipeWire stream down.
+//!
+//! PipeWire may negotiate the device's native rate/channel layout. The process
+//! callback downmixes and resamples to the pipeline format before queueing, so
+//! VAD/ASR always receive mono 16 kHz PCM.
 //!
 //! Samples are delivered on a bounded `sync_channel` of `Vec<f32>`. The PipeWire
 //! process callback only ever uses `try_send` so it never blocks the mainloop.
@@ -463,8 +467,9 @@ fn pipewire_thread(
             user_data.rate = info.rate();
             user_data.channels = info.channels().max(1);
             info!(
-                rate = user_data.rate,
-                channels = user_data.channels,
+                input_rate = user_data.rate,
+                input_channels = user_data.channels,
+                output_rate = crate::stt::SAMPLE_RATE_HZ,
                 "audio: capturing"
             );
         })
@@ -508,33 +513,28 @@ fn pipewire_thread(
                 return;
             }
 
-            let mut mono = Vec::with_capacity(n_frames);
-            if n_channels == 1 {
-                for i in 0..n_frames {
-                    let start = i * sample_bytes;
-                    let frame = f32::from_le_bytes([
-                        raw[start],
-                        raw[start + 1],
-                        raw[start + 2],
-                        raw[start + 3],
-                    ]);
-                    mono.push(frame);
-                }
+            // The graph may negotiate the device's native rate/channel layout
+            // even though we asked for mono 16 kHz. Convert before queueing so
+            // VAD and ASR never receive mislabeled PCM.
+            let mut interleaved = Vec::with_capacity(n_interleaved);
+            for sample in raw.chunks_exact(sample_bytes) {
+                interleaved.push(f32::from_le_bytes([
+                    sample[0], sample[1], sample[2], sample[3],
+                ]));
+            }
+            let input_rate = if user_data.rate == 0 {
+                crate::stt::SAMPLE_RATE_HZ
             } else {
-                for f in 0..n_frames {
-                    let mut acc = 0.0f32;
-                    for ch in 0..n_channels {
-                        let idx = (f * n_channels + ch) * sample_bytes;
-                        let s = f32::from_le_bytes([
-                            raw[idx],
-                            raw[idx + 1],
-                            raw[idx + 2],
-                            raw[idx + 3],
-                        ]);
-                        acc += s;
-                    }
-                    mono.push(acc / n_channels as f32);
-                }
+                user_data.rate
+            };
+            let mono = crate::dsp::convert_to_mono_rate(
+                &interleaved,
+                n_channels as u16,
+                input_rate,
+                crate::stt::SAMPLE_RATE_HZ,
+            );
+            if mono.is_empty() {
+                return;
             }
 
             match user_data.sample_tx.try_send(mono) {

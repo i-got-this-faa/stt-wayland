@@ -20,6 +20,7 @@
 
 mod audio;
 mod config;
+mod dsp;
 mod inject;
 mod model_catalog;
 mod overlay;
@@ -127,8 +128,9 @@ enum PipeCmd {
 }
 
 /// PipeWire emits a short connection transient when the capture stream is
-/// first attached. Do not let that transient reach VAD/STT as speech.
-const CAPTURE_STARTUP_IGNORE_MS: u32 = 750;
+/// first attached. Drop only the first few buffers; a long guard would clip
+/// the beginning of speech when the user starts talking immediately.
+const CAPTURE_STARTUP_IGNORE_MS: u32 = 100;
 
 // ─── entry ──────────────────────────────────────────────────────────────────
 
@@ -525,7 +527,6 @@ impl Daemon {
             &cfg.model,
             &cfg.post_process,
             cfg.audio.stt_channel_capacity,
-            stt::DEFAULT_OVERLAP_MS,
         ) {
             Ok(e) => e,
             Err(e) if cfg.model.residency == ModelResidency::Preload => {
@@ -537,7 +538,6 @@ impl Daemon {
                     &lazy,
                     &cfg.post_process,
                     cfg.audio.stt_channel_capacity,
-                    stt::DEFAULT_OVERLAP_MS,
                 )
                 .context("spawn STT worker (lazy fallback)")?
             }
